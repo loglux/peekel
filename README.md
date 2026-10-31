@@ -2,7 +2,7 @@
 
 [Русская версия](README.ru.md)
 
-![Far Manager: a photograph of a bear in the quick view, drawn by the Peekel plugin](docs/images/far-quickview.png)
+![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview.png)
 
 **Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, the
 start of a Word, PowerPoint or Excel file, and a card for fonts, programs and archives.
@@ -24,7 +24,7 @@ A console viewer (for F3, Linux and Midnight Commander) works and is being prepa
 
 ## What it looks like
 
-Far Manager, the quick view (Ctrl+Q) with the plugin. The photo and the PDF are public domain ([credits](docs/images/CREDITS.md)).
+Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public domain ([credits](docs/images/CREDITS.md)).
 
 **A Word document**
 

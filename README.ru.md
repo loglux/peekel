@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-![Far Manager: фотография медведя в быстром просмотре, нарисованная плагином Peekel](docs/images/far-quickview.png)
+![Far Manager: картинка в быстром просмотре, нарисованная плагином Peekel](docs/images/far-quickview.png)
 
 **Peekel это плагин быстрого просмотра для Far Manager**: нажмите Ctrl+Q и увидите в панели, что это за файл: картинку, SVG, PDF,
 начало файла Word, PowerPoint или Excel, карточку для шрифтов, программ и архивов.
@@ -23,7 +23,7 @@
 
 ## Как выглядит
 
-Far Manager, быстрый просмотр (Ctrl+Q) с плагином. Фото и PDF в общественном достоянии ([источники](docs/images/CREDITS.md)).
+Far Manager, быстрый просмотр (Ctrl+Q) с плагином. Обложка PDF в общественном достоянии ([источники](docs/images/CREDITS.md)).
 
 **Документ Word**
 
