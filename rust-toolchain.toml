@@ -1,0 +1,5 @@
+# "stable", not a version: a pinned 1.99 is a separate toolchain for rustup and was downloaded again beside the
+# installed stable. The floor is `rust-version` in Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

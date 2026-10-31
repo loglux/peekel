@@ -1,0 +1,19 @@
+[package]
+name = "peekel-far"
+description = "Far Manager plugin: a picture in the quick view panel as Sixel (an experiment, see docs/far-plugin.md)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "peekel_far"
+crate-type = ["cdylib"]
+
+[dependencies]
+peekel-core = { path = "../core" }
+
+[lints]
+workspace = true

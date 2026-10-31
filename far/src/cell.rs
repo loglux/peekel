@@ -1,0 +1,284 @@
+//! The size of a cell in pixels, asked of the terminal while Far runs.
+//!
+//! The terminal answers the question `CSI 16 t` by typing `CSI 6 ; height ; width t` into the input, which Far would
+//! take for key presses. But a plugin sees every input record before Far handles it (`ProcessConsoleInputW`), so while
+//! an answer is awaited the records that make up escape sequences are taken out there and never reach Far.
+//!
+//! Like Far's own queries, the question is put between two questions every terminal answers (`CSI 0 c`, the device
+//! attributes): when the second of those answers has come, the answer to the question between them has come too or never
+//! will, and the waiting is over. The terminal answers only after it has dealt with what was written before (a large
+//! Sixel picture, say), so the answers may be late; the keys of the user (anything that is not an escape sequence) pass.
+//!
+//! The question is asked at the start, when the layout of the panels changes (the window was resized or the font
+//! zoomed), and now and then while the user is not typing. `PEEKEL_CELL` (`10x20`), when set, is used and nothing is
+//! asked.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::api::{InputRecord, KEY_EVENT};
+use crate::draw;
+use crate::log;
+
+/// What a cell is taken as when nothing is known: the default of Windows Terminal's font at 100 % scaling.
+const DEFAULT: (usize, usize) = (10, 20);
+/// The longest an answer is awaited.
+const WAIT: Duration = Duration::from_secs(8);
+/// The user must not have pressed a key for this long before a question is asked.
+const QUIET: Duration = Duration::from_millis(800);
+/// A question is asked again after this long, if the layout has not changed.
+const EVERY: Duration = Duration::from_secs(15);
+
+/// The size last told by the terminal, width << 16 | height; 0 while unknown.
+static MEASURED: AtomicU32 = AtomicU32::new(0);
+static STATE: Mutex<State> = Mutex::new(State {
+    waiting_since: None,
+    reader: Reader::new(),
+    last_key: None,
+    last_asked: None,
+    layout: None,
+});
+
+struct State {
+    /// A question is out and its answer is awaited.
+    waiting_since: Option<Instant>,
+    reader: Reader,
+    /// When the user last pressed a key (an answer is not counted).
+    last_key: Option<Instant>,
+    last_asked: Option<Instant>,
+    /// The layout of the panels at the last look: when it changes, the cell may have.
+    layout: Option<[i32; 8]>,
+}
+
+/// What reading one more character of the input comes to.
+#[derive(Debug, PartialEq)]
+enum Feed {
+    /// Not part of an answer: it goes on to Far.
+    Pass,
+    /// Part of an escape sequence: taken out.
+    Taken,
+    /// The second device-attributes answer came: the waiting is over, with the size if it was told.
+    Done(Option<(usize, usize)>),
+}
+
+/// Takes escape sequences apart as their characters come: `ESC [ parameters final-character`.
+struct Reader {
+    sequence: String,
+    attributes_seen: u8,
+    cell: Option<(usize, usize)>,
+}
+
+impl Reader {
+    const fn new() -> Self {
+        Self {
+            sequence: String::new(),
+            attributes_seen: 0,
+            cell: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn feed(&mut self, ch: char) -> Feed {
+        if self.sequence.is_empty() {
+            if ch == '\x1b' {
+                self.sequence.push(ch);
+                return Feed::Taken;
+            }
+            return Feed::Pass;
+        }
+        if self.sequence.len() == 1 && ch != '[' {
+            // a lone Escape of the user's, not the start of an answer (it is lost; what follows is theirs)
+            self.sequence.clear();
+            return Feed::Pass;
+        }
+        self.sequence.push(ch);
+        if self.sequence.len() > 2 && ('@'..='~').contains(&ch) {
+            let sequence = std::mem::take(&mut self.sequence);
+            if sequence.starts_with("\x1b[?") && ch == 'c' {
+                self.attributes_seen += 1;
+            } else if let Some(cell) = parse_answer(&sequence) {
+                self.cell = Some(cell);
+            }
+            if self.attributes_seen >= 2 {
+                return Feed::Done(self.cell);
+            }
+        } else if self.sequence.len() > 64 {
+            // no sequence of an answer is this long: not one
+            self.sequence.clear();
+        }
+        Feed::Taken
+    }
+}
+
+/// From `PEEKEL_CELL` (`10x20`).
+fn given() -> Option<(usize, usize)> {
+    let v = std::env::var("PEEKEL_CELL").ok()?;
+    let (w, h) = v.split_once('x')?;
+    plausible(w.parse().ok()?, h.parse().ok()?)
+}
+
+/// The cell as the plugin takes it: given by hand, else what the terminal said, else 10 x 20.
+pub fn current() -> (usize, usize) {
+    if let Some(cell) = given() {
+        return cell;
+    }
+    match MEASURED.load(Ordering::SeqCst) {
+        0 => DEFAULT,
+        packed => ((packed >> 16) as usize, (packed & 0xFFFF) as usize),
+    }
+}
+
+/// The size an answer `ESC [ 6 ; height ; width t` tells, as (width, height), if it is a whole sane one.
+fn parse_answer(text: &str) -> Option<(usize, usize)> {
+    let inner = text.strip_prefix("\x1b[6;")?.strip_suffix('t')?;
+    let (height, width) = inner.split_once(';')?;
+    plausible(width.parse().ok()?, height.parse().ok()?)
+}
+
+/// A cell of this size is believable (a zero, or a size that would make a picture of gigabytes, is not).
+fn plausible(width: usize, height: usize) -> Option<(usize, usize)> {
+    ((4..=64).contains(&width) && (8..=128).contains(&height)).then_some((width, height))
+}
+
+/// Every input record, before Far has it: true when it is a part of an answer awaited, and is to be taken out.
+pub fn takes(record: &InputRecord) -> bool {
+    if record.event_type != KEY_EVENT {
+        return false;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return false;
+    };
+    let ch = char::from_u32(u32::from(record.ch)).unwrap_or('\0');
+    let key_down = record.key_down != 0;
+    if std::env::var_os("PEEKEL_TRACE_INPUT").is_some() {
+        log::line(&format!(
+            "input: down {key_down} char {:#x} key {:#x} control {:#x}, awaited: {}",
+            record.ch,
+            record.virtual_key,
+            record.control_keys,
+            state.waiting_since.is_some()
+        ));
+    }
+    if state.waiting_since.is_none() {
+        if key_down {
+            state.last_key = Some(Instant::now());
+        }
+        return false;
+    }
+    if !key_down {
+        // the release of a key: taken when it is in the middle of a sequence
+        return !state.reader.sequence.is_empty();
+    }
+    match state.reader.feed(ch) {
+        Feed::Pass => {
+            state.last_key = Some(Instant::now());
+            false
+        }
+        Feed::Taken => true,
+        Feed::Done(cell) => {
+            state.waiting_since = None;
+            state.reader.reset();
+            drop(state);
+            match cell {
+                Some((w, h)) => {
+                    let packed = (w as u32) << 16 | h as u32;
+                    if MEASURED.swap(packed, Ordering::SeqCst) != packed {
+                        log::line(&format!("the terminal says a cell is {w}x{h} px"));
+                    }
+                }
+                None => log::line("the terminal answered, but not the question about the cell"),
+            }
+            true
+        }
+    }
+}
+
+/// Asks the question, if a layout change or the time calls for it and the user is not typing. `layout` is the frames of
+/// the panels (left, top, right, bottom of both).
+pub fn tick(layout: [i32; 8]) {
+    if given().is_some() {
+        return;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(since) = state.waiting_since {
+        if now.duration_since(since) >= WAIT {
+            log::line("the terminal did not finish answering the question about the cell");
+            state.waiting_since = None;
+            state.reader.reset();
+        }
+        return;
+    }
+    let changed = state.layout != Some(layout);
+    state.layout = Some(layout);
+    let due = state.last_asked.is_none_or(|at| now.duration_since(at) >= EVERY);
+    let quiet = state.last_key.is_none_or(|at| now.duration_since(at) >= QUIET);
+    if (changed || due) && quiet {
+        state.waiting_since = Some(now);
+        state.last_asked = Some(now);
+        state.reader.reset();
+        drop(state);
+        // the question between two that are always answered
+        if let Err(e) = draw::write_console("\x1b[0c\x1b[16t\x1b[0c") {
+            log::line(&format!("cannot ask about the cell: {e}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_all(reader: &mut Reader, text: &str) -> Vec<Feed> {
+        text.chars().map(|c| reader.feed(c)).collect()
+    }
+
+    const ATTRIBUTES: &str = "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42c";
+
+    #[test]
+    fn the_size_is_read_between_the_two_attribute_answers() {
+        let mut reader = Reader::new();
+        let text = format!("{ATTRIBUTES}\x1b[6;28;14t{ATTRIBUTES}");
+        let fed = feed_all(&mut reader, &text);
+        assert!(fed[..fed.len() - 1].iter().all(|f| *f == Feed::Taken));
+        assert_eq!(fed.last(), Some(&Feed::Done(Some((14, 28)))));
+    }
+
+    #[test]
+    fn a_terminal_that_does_not_know_the_question_ends_it_with_no_size() {
+        let mut reader = Reader::new();
+        let fed = feed_all(&mut reader, &format!("{ATTRIBUTES}{ATTRIBUTES}"));
+        assert_eq!(fed.last(), Some(&Feed::Done(None)));
+    }
+
+    #[test]
+    fn the_keys_of_the_user_pass_even_in_the_middle_of_an_answer() {
+        let mut reader = Reader::new();
+        assert_eq!(reader.feed('a'), Feed::Pass);
+        assert_eq!(reader.feed('\x1b'), Feed::Taken);
+        assert_eq!(reader.feed('['), Feed::Taken);
+        // a lone Escape then an ordinary key: not an answer
+        let mut lone = Reader::new();
+        assert_eq!(lone.feed('\x1b'), Feed::Taken);
+        assert_eq!(lone.feed('x'), Feed::Pass);
+        assert_eq!(lone.feed('y'), Feed::Pass);
+    }
+
+    #[test]
+    fn a_size_out_of_reason_is_not_taken() {
+        assert_eq!(parse_answer("\x1b[6;0;0t"), None);
+        assert_eq!(parse_answer("\x1b[6;20t"), None);
+        assert_eq!(parse_answer("\x1b[6;2000;1000t"), None);
+        assert_eq!(parse_answer("\x1b[6;20;10t"), Some((10, 20)));
+        // the same for a size given by hand (`PEEKEL_CELL=0x0` divided by zero, a huge one made huge pictures)
+        assert_eq!(plausible(0, 0), None);
+        assert_eq!(plausible(100_000, 100_000), None);
+        assert_eq!(plausible(10, 20), Some((10, 20)));
+    }
+}

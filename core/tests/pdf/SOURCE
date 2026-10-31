@@ -1,0 +1,7 @@
+Written for Peekel (30 October 2026); core/tests/pdf.rs and core/tests/hostile.rs use them. No licence question.
+
+text.pdf  written by hand (a python script of the author's session): a page of 200 x 100 points, a red box and the words
+          "Hello PDF" in Helvetica (not embedded: the standard fonts of the PDF reader are used).
+scan.pdf  made by Pillow 11 from a picture: one JPEG on the page, the left half blue and the right half yellow.
+three-pages.pdf  written by hand (a python script of the author's session): three pages of 200 x 100 points, a red one, a green one and a
+          blue one, each with the words "Page 1" ... "Page 3" in Helvetica.

@@ -1,0 +1,106 @@
+# Peekel
+
+[Русская версия](README.ru.md)
+
+![Far Manager: a photograph of a bear in the quick view, drawn by the Peekel plugin](docs/images/far-quickview.png)
+
+**Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, the
+start of a Word, PowerPoint or Excel file, and a card for fonts, programs and archives.
+
+A console viewer (for F3, Linux and Midnight Commander) works and is being prepared; it will be published a little later.
+
+## Why
+
+- **Ctrl+Q works in Windows Terminal.** Far's quick view shows the picture, the document or a card in the panel, as you move
+  over the files.
+- **No second window.** Peekel draws with Sixel graphics inside the terminal's own cells, so nothing floats over the console
+  and has to be kept in place, and it works over SSH too.
+- **More than pictures.** A PDF, the start of a Word, PowerPoint or Excel file, a card for a font (in its own letters), a
+  program, a ZIP: the kind, size, dates, what is inside. When the name says nothing (a recovered `.chk` fragment) it tells what a
+  file is by its content, and it warns when a name and the content disagree.
+- **Damaged files are safe.** The size, the time and the depth of reading are limited; a broken file gives a message, not a
+  crash.
+- **One DLL, no runtime.** Written in Rust. Open source, MIT or Apache-2.0.
+
+## What it looks like
+
+Far Manager, the quick view (Ctrl+Q) with the plugin. The photo and the PDF are public domain ([credits](docs/images/CREDITS.md)).
+
+**A Word document**
+
+![A Word document in the quick view of Far](docs/images/far-word.png)
+
+**An Excel sheet**
+
+![An Excel sheet in the quick view of Far](docs/images/far-excel.png)
+
+**A PowerPoint slide**
+
+![A PowerPoint slide in the quick view of Far](docs/images/far-powerpoint.png)
+
+**A PDF**
+
+![The cover of a PDF brochure in the quick view of Far](docs/images/far-pdf.png)
+
+**A ZIP archive: what is inside**
+
+![The card of a ZIP archive in the quick view of Far](docs/images/far-zip.png)
+
+**A font, in its own letters**
+
+![The card of a font in the quick view of Far](docs/images/far-font.png)
+
+**A file whose name says nothing, recognised by its content**
+
+![A file called 61000000file.chk, recognised as a Word document: size, dates, title and author](docs/images/far-recovered.png)
+
+## What it shows
+
+| What | In the quick view |
+|---|---|
+| PNG, JPEG, GIF (first frame), BMP, WebP, TIFF, SVG | the picture |
+| PDF (text pages and scans; not password-protected) | the first page |
+| Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
+| Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
+| Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |
+
+A picture with a colour profile (Display P3, Adobe RGB) is converted to sRGB, and EXIF orientation is honoured. **Documents are
+previews, not copies**: words are wrapped by a guess, and charts, text boxes, headers and footers and much else are not drawn.
+Text in SVGs and documents is drawn with the fonts installed on the machine; a document that names a font that is not installed
+gets another one.
+
+## Install
+
+Take the archive of the [latest release](../../releases/latest): `Peekel-<version>-windows-x64.zip`. It has a `.sha256` file:
+check it. You need Far 3.0 (64-bit) in a terminal that shows Sixel: **Windows Terminal 1.22 or newer**, or xterm, mlterm, foot and
+others. **ConEmu is not supported**: it does not show Sixel (the newest release, 230724 of July 2023, draws no picture) and is no
+longer developed.
+
+Close Far and run `install.ps1` from the archive. It finds your Far; if it finds none or several, say which:
+`.\install.ps1 -Far 'C:\Tools\Far'`. `-Uninstall` removes the plugin, `-WhatIf` shows what would be done. By hand: copy the folder
+`Peekel` into the `Plugins` folder next to `Far.exe` (or into `%APPDATA%\Far Manager\Profile\Plugins`). Start Far, press Ctrl+Q
+and move over files.
+
+From source: install Rust (the version is in `rust-toolchain.toml`) and run `cargo build --release -p peekel-far`; the plugin is
+`target/release/peekel_far.dll`.
+
+## Using it
+
+Press Ctrl+Q in a panel to make the other panel a quick view, and move the cursor: a picture, a document or a card is drawn in
+the frame, over the text Far would print there; text files are shown by Far as usual. If something is wrong, set an environment
+variable before starting Far:
+
+| Variable | Does |
+|---|---|
+| `PEEKEL_FAR_LOG=<file>` | the plugin writes what it does to this file (send it with a bug report) |
+| `PEEKEL_OFF=hook` | switches the plugin off without removing it |
+| `PEEKEL_CELL=10x20` | the size of a terminal cell in pixels, when the terminal cannot be asked |
+
+If another picture plugin is installed, switch off its quick view processing, or both will try to draw. There is no settings
+dialog yet; if you want to turn something off, say which.
+
+## Licence
+
+Peekel is under **either** of the [MIT licence](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option.
+Copyright (c) 2026 Vladislav Sorokin. The licences of the libraries inside the DLL are in `THIRD-PARTY-LICENSES.txt` in the
+archive; all are permissive (MIT, Apache-2.0, BSD, Zlib, Unicode).

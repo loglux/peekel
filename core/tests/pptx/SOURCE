@@ -1,0 +1,6 @@
+Written for Peekel (30 October 2026); core/tests/hostile.rs uses it as the file to cut and spoil. No licence question.
+
+sample.pptx  made by a python script of the author's session (zipfile): a 16:9 slide with a title and a body placeholder that
+             take their place and style from the layout and the master (two levels of bullets, a bold word, normAutofit), an
+             orange ellipse in a theme colour with a line of white text, a table of three columns with a shaded header
+             row, and a stripe in the accent colour that the master draws. No picture.

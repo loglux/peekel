@@ -1,0 +1,10 @@
+Test pictures, copied from BlueEdit (another project of the author's; commit 87cfaee for the Darwin pair):
+
+exif-1.jpg .. exif-8.jpg   tests/BlueEdit.Tests/images: 40 x 20, red left, blue right, green top left once turned the way
+                           the file's EXIF orientation (1..8) says; made with Pillow by BlueEdit's author.
+growth.png                 tools/screenshots/samples/darwin: a chart (growth.py there makes it).
+diagram.jpg                the same folder: Darwin's only figure in On the Origin of Species (1859), a public-domain
+                           scan; the licence was not checked again for Peekel.
+
+badge.svg                  written for Peekel (29 October 2026): a gradient, a circle, a path and a line of text;
+                           no licence question.

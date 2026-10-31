@@ -1,0 +1,7 @@
+Written for Peekel (30 October 2026) with Pillow 11; core/tests/colour.rs uses them. No licence question.
+
+grey16.png     a 16-bit grey ramp of 256 columns
+greyalpha.png  grey with alpha: opaque mid-grey on the left, half-clear white on the right
+cmyk.jpg       a CMYK JPEG of five bands: cyan, magenta, yellow, black, none
+
+They are not in tests/images because the pty test of Space and Backspace counts the pictures of that folder.

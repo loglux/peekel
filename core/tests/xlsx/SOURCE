@@ -1,0 +1,5 @@
+Written for Peekel (30 October 2026); core/tests/hostile.rs uses it as the file to cut and spoil. No licence question.
+
+sample.xlsx  made by a python script of the author's session (zipfile): a sheet "Budget" with a merged title in 16 pt bold, a
+             header row (white bold text on blue, thin borders), two rows with a pound amount and a date, and a long note
+             two rows below that goes on into the empty cells beside it. Shared strings, styles and a custom number format.
