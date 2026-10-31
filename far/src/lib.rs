@@ -67,7 +67,7 @@ pub unsafe extern "system" fn GetGlobalInfoW(info: *mut GlobalInfo) {
     let info = unsafe { &mut *info };
     info.struct_size = size_of::<GlobalInfo>();
     info.min_far_version = VersionInfo::new(3, 0, 0, 0);
-    info.version = VersionInfo::new(0, 0, 1, 0);
+    info.version = VersionInfo::new(0, 2, 0, 0);
     info.guid = GUID;
     info.title = utf16("Peekel").as_ptr();
     info.description = utf16("A picture in the quick view panel as Sixel").as_ptr();
@@ -134,7 +134,9 @@ pub unsafe extern "system" fn ProcessViewerEventW(info: *const ProcessViewerEven
 pub unsafe extern "system" fn ProcessConsoleInputW(info: *const ProcessConsoleInputInfo) -> isize {
     let info = unsafe { &*info };
     let mut taken = false;
-    guarded("the input", || taken = cell::takes(&info.record));
+    guarded("the input", || {
+        taken = draw::takes_info_key(&info.record) || cell::takes(&info.record)
+    });
     isize::from(taken)
 }
 

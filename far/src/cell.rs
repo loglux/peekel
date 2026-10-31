@@ -62,11 +62,14 @@ enum Feed {
     Done(Option<(usize, usize)>),
 }
 
-/// Takes escape sequences apart as their characters come: `ESC [ parameters final-character`.
+/// Takes escape sequences apart as their characters come: `ESC [ parameters final-character`, and the answers about
+/// colours, `ESC ] 4 ; index ; rgb:rr/gg/bb` ended by `BEL` or `ESC \`.
 struct Reader {
     sequence: String,
     attributes_seen: u8,
     cell: Option<(usize, usize)>,
+    /// The terminal's 16 colours as told, by the index of the escape codes (not the console's).
+    palette: [Option<[u8; 3]>; 16],
 }
 
 impl Reader {
@@ -75,6 +78,7 @@ impl Reader {
             sequence: String::new(),
             attributes_seen: 0,
             cell: None,
+            palette: [None; 16],
         }
     }
 
@@ -90,12 +94,23 @@ impl Reader {
             }
             return Feed::Pass;
         }
-        if self.sequence.len() == 1 && ch != '[' {
+        if self.sequence.len() == 1 && ch != '[' && ch != ']' {
             // a lone Escape of the user's, not the start of an answer (it is lost; what follows is theirs)
             self.sequence.clear();
             return Feed::Pass;
         }
         self.sequence.push(ch);
+        if self.sequence.starts_with("\x1b]") {
+            if ch == '\x07' || self.sequence.ends_with("\x1b\\") {
+                let sequence = std::mem::take(&mut self.sequence);
+                if let Some((index, rgb)) = parse_palette_answer(&sequence) {
+                    self.palette[index] = Some(rgb);
+                }
+            } else if self.sequence.len() > 64 {
+                self.sequence.clear();
+            }
+            return Feed::Taken;
+        }
         if self.sequence.len() > 2 && ('@'..='~').contains(&ch) {
             let sequence = std::mem::take(&mut self.sequence);
             if sequence.starts_with("\x1b[?") && ch == 'c' {
@@ -137,6 +152,40 @@ fn parse_answer(text: &str) -> Option<(usize, usize)> {
     let inner = text.strip_prefix("\x1b[6;")?.strip_suffix('t')?;
     let (height, width) = inner.split_once(';')?;
     plausible(width.parse().ok()?, height.parse().ok()?)
+}
+
+/// The colour an answer `ESC ] 4 ; index ; rgb:rrrr/gggg/bbbb` tells, as (index, red, green, blue); each channel has one
+/// to four hex digits and only its first two count.
+fn parse_palette_answer(text: &str) -> Option<(usize, [u8; 3])> {
+    let inner = text.strip_prefix("\x1b]4;")?;
+    let inner = inner.strip_suffix('\x07').or_else(|| inner.strip_suffix("\x1b\\"))?;
+    let (index, colour) = inner.split_once(';')?;
+    let index: usize = index.parse().ok().filter(|i| *i < 16)?;
+    let mut channels = colour.strip_prefix("rgb:")?.split('/');
+    let mut channel = || {
+        let digits = channels.next()?;
+        u8::from_str_radix(digits.get(..2.min(digits.len()))?, 16)
+            .ok()
+            .map(|v| if digits.len() == 1 { v * 17 } else { v })
+    };
+    let rgb = [channel()?, channel()?, channel()?];
+    channels.next().is_none().then_some((index, rgb))
+}
+
+/// The terminal's palette colours, by the index of the escape codes; unknown until the terminal has answered.
+static PALETTE: Mutex<[Option<[u8; 3]>; 16]> = Mutex::new([None; 16]);
+
+/// What the terminal says the console colour `index` (0..16, Far's, which follow the console's attribute bits: bit 0 is
+/// blue, bit 2 red) looks like, if it has said.
+pub fn palette_colour(index: u32) -> Option<[u8; 3]> {
+    let i = index & 15;
+    let ansi = (i >> 2 & 1) + (i >> 1 & 1) * 2 + (i & 1) * 4 + (i & 8);
+    PALETTE.lock().ok()?[ansi as usize]
+}
+
+/// The questions about the 16 colours, one after the other.
+fn palette_question() -> String {
+    (0..16).map(|i| format!("\x1b]4;{i};?\x1b\\")).collect()
 }
 
 /// A cell of this size is believable (a zero, or a size that would make a picture of gigabytes, is not).
@@ -181,8 +230,16 @@ pub fn takes(record: &InputRecord) -> bool {
         Feed::Taken => true,
         Feed::Done(cell) => {
             state.waiting_since = None;
+            let palette = state.reader.palette;
             state.reader.reset();
             drop(state);
+            if palette.iter().any(Option::is_some)
+                && let Ok(mut known) = PALETTE.lock()
+                && *known != palette
+            {
+                *known = palette;
+                log::line(&format!("the terminal says its colours are {palette:?}"));
+            }
             match cell {
                 Some((w, h)) => {
                     let packed = (w as u32) << 16 | h as u32;
@@ -224,8 +281,8 @@ pub fn tick(layout: [i32; 8]) {
         state.last_asked = Some(now);
         state.reader.reset();
         drop(state);
-        // the question between two that are always answered
-        if let Err(e) = draw::write_console("\x1b[0c\x1b[16t\x1b[0c") {
+        // the questions between two that are always answered
+        if let Err(e) = draw::write_console(&format!("\x1b[0c\x1b[16t{}\x1b[0c", palette_question())) {
             log::line(&format!("cannot ask about the cell: {e}"));
         }
     }
@@ -268,6 +325,56 @@ mod tests {
         assert_eq!(lone.feed('\x1b'), Feed::Taken);
         assert_eq!(lone.feed('x'), Feed::Pass);
         assert_eq!(lone.feed('y'), Feed::Pass);
+    }
+
+    #[test]
+    fn the_colours_are_read_between_the_attribute_answers_with_either_ending() {
+        let mut reader = Reader::new();
+        let text = format!(
+            "{ATTRIBUTES}\x1b[6;28;14t\x1b]4;4;rgb:0000/3737/dada\x1b\\\x1b]4;1;rgb:c5c5/0f0f/1f1f\x07{ATTRIBUTES}"
+        );
+        let fed = feed_all(&mut reader, &text);
+        assert!(fed[..fed.len() - 1].iter().all(|f| *f == Feed::Taken));
+        assert_eq!(fed.last(), Some(&Feed::Done(Some((14, 28)))));
+        assert_eq!(reader.palette[4], Some([0x00, 0x37, 0xda]));
+        assert_eq!(reader.palette[1], Some([0xc5, 0x0f, 0x1f]));
+        assert_eq!(reader.palette[0], None);
+    }
+
+    #[test]
+    fn a_colour_answer_that_is_not_whole_is_not_taken() {
+        assert_eq!(
+            parse_palette_answer("\x1b]4;4;rgb:00/37/da\x07"),
+            Some((4, [0, 0x37, 0xda]))
+        );
+        assert_eq!(parse_palette_answer("\x1b]4;16;rgb:00/37/da\x07"), None);
+        assert_eq!(parse_palette_answer("\x1b]4;4;rgb:00/37\x07"), None);
+        assert_eq!(parse_palette_answer("\x1b]4;4;rgb:00/37/da/ff\x07"), None);
+        assert_eq!(parse_palette_answer("\x1b]4;4;rgb:zz/37/da\x07"), None);
+        assert_eq!(parse_palette_answer("\x1b]4;4;rgb:00/37/da"), None);
+        assert_eq!(parse_palette_answer("\x1b]4;4;rgb://\x07"), None);
+    }
+
+    fn set_palette(colours: [Option<[u8; 3]>; 16]) {
+        if let Ok(mut known) = PALETTE.lock() {
+            *known = colours;
+        }
+    }
+
+    #[test]
+    fn the_console_colours_are_asked_for_by_the_codes_of_the_escape_sequences() {
+        let mut known = [None; 16];
+        for (ansi, slot) in known.iter_mut().enumerate() {
+            *slot = Some([ansi as u8, 0, 0]);
+        }
+        set_palette(known);
+        // the console's blue (1) is the escape codes' 4, its red (4) their 1, and the bright ones follow
+        assert_eq!(palette_colour(1), Some([4, 0, 0]));
+        assert_eq!(palette_colour(4), Some([1, 0, 0]));
+        assert_eq!(palette_colour(9), Some([12, 0, 0]));
+        assert_eq!(palette_colour(7), Some([7, 0, 0]));
+        set_palette([None; 16]);
+        assert_eq!(palette_colour(1), None);
     }
 
     #[test]

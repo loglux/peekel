@@ -46,6 +46,8 @@ struct Target {
     cell: (usize, usize),
     /// Whether the file is a copy Far took out of a plugin's panel (an archive): the panel's neighbours are then no files.
     from_plugin: bool,
+    /// The card of the file (kind, size, EXIF) is shown in place of the picture (Ctrl+Alt+I).
+    info: bool,
 }
 
 impl Target {
@@ -103,6 +105,9 @@ struct Hidden {
     viewer: isize,
     colours: Vec<(usize, api::FarColor)>,
 }
+/// The file whose card is asked for in place of its picture (Ctrl+Alt+I); the cursor moving to another file, or the quick
+/// view closing, ends it (`card_wanted`, `forget_card`).
+static INFO_FOR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static LAST_NOTE: Mutex<String> = Mutex::new(String::new());
 /// The viewer of the quick view and the file it has open. For a file in an archive (or any other plugin's panel) that is
 /// the copy Far took out into a temporary place: the panel's own item is no path, but this is.
@@ -297,6 +302,68 @@ pub fn show_text() {
     }
 }
 
+/// Ctrl+Alt+I: the virtual key `I` with a Ctrl (left or right) and an Alt (left or right) held, and no Shift.
+fn is_info_key(virtual_key: u16, control_keys: u32) -> bool {
+    const RIGHT_ALT: u32 = 0x1;
+    const LEFT_ALT: u32 = 0x2;
+    const RIGHT_CTRL: u32 = 0x4;
+    const LEFT_CTRL: u32 = 0x8;
+    const SHIFT: u32 = 0x10;
+    virtual_key == u16::from(b'I')
+        && control_keys & (RIGHT_ALT | LEFT_ALT) != 0
+        && control_keys & (RIGHT_CTRL | LEFT_CTRL) != 0
+        && control_keys & SHIFT == 0
+}
+
+/// Every input record, before Far has it: Ctrl+Alt+I, while a picture is shown in the quick view, turns the card of the
+/// file on and off in place of the picture. True when the record is that key (the press and the release both: Far is not
+/// to see half of it).
+pub fn takes_info_key(record: &api::InputRecord) -> bool {
+    if record.event_type != api::KEY_EVENT || !is_info_key(record.virtual_key, record.control_keys) {
+        return false;
+    }
+    let Ok(state) = STATE.lock() else {
+        return false;
+    };
+    let Some(target) = state.target.as_ref() else {
+        return false; // no picture in the quick view: the key is Far's
+    };
+    if record.key_down != 0
+        && let Ok(mut asked) = INFO_FOR.lock()
+    {
+        *asked = if asked.as_deref() == Some(target.path.as_path()) {
+            None
+        } else {
+            Some(target.path.clone())
+        };
+        log::line(&format!(
+            "Ctrl+Alt+I: the card is {}",
+            if asked.is_some() { "on" } else { "off" }
+        ));
+    }
+    true
+}
+
+/// Whether the card of `path` is asked for. The card is asked for one file at a time: when the file shown is another one,
+/// the question is forgotten, and coming back to the first file shows its picture.
+fn card_wanted(path: &Path) -> bool {
+    let Ok(mut asked) = INFO_FOR.lock() else {
+        return false;
+    };
+    if asked.as_deref() == Some(path) {
+        return true;
+    }
+    *asked = None;
+    false
+}
+
+/// The quick view is closed: the next time it is open, a file shows its picture.
+fn forget_card() {
+    if let Ok(mut asked) = INFO_FOR.lock() {
+        *asked = None;
+    }
+}
+
 pub fn tick() {
     if off("tick") {
         return;
@@ -309,6 +376,7 @@ pub fn tick() {
     };
     if other.kind != PTYPE_QVIEWPANEL {
         note(format!("the other panel is type {}, not the quick view", other.kind));
+        forget_card();
         return release();
     }
     let Some(this) = api::active_panel() else {
@@ -336,11 +404,13 @@ pub fn tick() {
         right,
         bottom,
     } = other.rect;
+    let info = card_wanted(&path);
     let want = Target {
         path,
         rect: (left, top, right, bottom),
         cell: cell(),
         from_plugin,
+        info,
     };
     crate::cell::tick([
         this.rect.left,
@@ -394,7 +464,7 @@ fn begin(state: &mut State, want: Target) {
     let background = colour.map_or([0, 0, 0], |c| c.background_rgb());
     let cell = cell();
     let room = (cols * cell.0, rows * cell.1);
-    let wanted = key_of(&want.path, room, background);
+    let wanted = key_of(&want.path, room, background, want.info);
     let hit = CACHE.lock().ok().and_then(|mut cache| cache.get(&wanted));
     // the files next to the cursor, nearest first: the next one is the likeliest to be wanted
     let around = if want.from_plugin {
@@ -405,7 +475,7 @@ fn begin(state: &mut State, want: Target) {
     let neighbours: Vec<Key> = around
         .into_iter()
         .filter(|p| is_picture(p))
-        .map(|p| key_of(&p, room, background))
+        .map(|p| key_of(&p, room, background, false))
         .collect();
     let neighbours = if off("ahead") { Vec::new() } else { neighbours };
     state.began = Some(Instant::now());
@@ -479,12 +549,13 @@ fn hand_over(job: Job) {
     }
 }
 
-fn key_of(path: &Path, room: (usize, usize), background: [u8; 3]) -> Key {
+fn key_of(path: &Path, room: (usize, usize), background: [u8; 3], info: bool) -> Key {
     let meta = std::fs::metadata(path).ok();
     Key {
         path: path.to_path_buf(),
         room,
         background,
+        info,
         length: meta.as_ref().map_or(0, std::fs::Metadata::len),
         modified: meta.and_then(|m| m.modified().ok()),
     }
@@ -536,7 +607,7 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
         return Ok(found);
     }
     // a file that is no picture, or one that cannot be read as one (a cut PNG, an encrypted PDF), gets a card
-    let decoded = if is_picture(&key.path) {
+    let decoded = if is_picture(&key.path) && !key.info {
         decode::decode_full(&key.path).map_err(|e| {
             log::line(&format!("{}: {e}: a card instead", key.path.display()));
             e
@@ -554,13 +625,7 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     let mut picture = decode::to_picture(&decode::fit(image, key.room.0, key.room.1));
     // what is clear is shown in the panel's own colour, not black
     let [br, bg, bb] = background;
-    for p in &mut picture.argb {
-        let a = *p >> 24;
-        if a < 255 {
-            let mix = |shift: u32, back: u8| (((*p >> shift) & 255) * a + u32::from(back) * (255 - a) + 127) / 255;
-            *p = 0xFF00_0000 | mix(16, br) << 16 | mix(8, bg) << 8 | mix(0, bb);
-        }
-    }
+    decode::composite_over(&mut picture.argb, background);
     // a whole number of cells each way, the rest in the panel's colour: no strip of a cell is left uncovered,
     // where whatever is under the picture would show
     let (cw, ch) = cell();
@@ -744,6 +809,26 @@ fn vt_on(console: &std::fs::File) {
 mod tests {
     use super::*;
 
+    fn ask_card_for(path: Option<&str>) {
+        if let Ok(mut asked) = INFO_FOR.lock() {
+            *asked = path.map(PathBuf::from);
+        }
+    }
+
+    #[test]
+    fn the_card_is_asked_for_one_file_and_forgotten_when_another_is_shown_or_the_quick_view_closes() {
+        ask_card_for(Some("a.jpg"));
+        assert!(card_wanted(Path::new("a.jpg")));
+        assert!(!card_wanted(Path::new("b.jpg")), "another file shows its picture");
+        assert!(
+            !card_wanted(Path::new("a.jpg")),
+            "and coming back to the first one does not bring the card back"
+        );
+        ask_card_for(Some("a.jpg"));
+        forget_card();
+        assert!(!card_wanted(Path::new("a.jpg")), "a closed quick view forgets it");
+    }
+
     #[test]
     fn erasing_leaves_the_pictures_place_alone() {
         // a frame of 9 x 6 cells: the inside is 8 columns from column 2, 4 rows from row 2
@@ -774,6 +859,18 @@ mod tests {
             );
             assert!(!around.contains(&format!("\x1b[{row};4H")), "none on it, row {row}");
         }
+    }
+
+    #[test]
+    fn ctrl_alt_i_is_the_key_for_the_card_and_nothing_less() {
+        let (ctrl, alt, shift) = (0x8, 0x2, 0x10);
+        assert!(is_info_key(u16::from(b'I'), ctrl | alt));
+        assert!(is_info_key(u16::from(b'I'), 0x4 | 0x1), "the right Ctrl and Alt too");
+        assert!(!is_info_key(u16::from(b'I'), ctrl), "Ctrl alone is Far's");
+        assert!(!is_info_key(u16::from(b'I'), alt));
+        assert!(!is_info_key(u16::from(b'I'), 0), "so is a plain i");
+        assert!(!is_info_key(u16::from(b'I'), ctrl | alt | shift));
+        assert!(!is_info_key(u16::from(b'O'), ctrl | alt));
     }
 
     #[test]

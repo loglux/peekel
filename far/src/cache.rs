@@ -14,6 +14,8 @@ pub struct Key {
     /// The pixels the picture had to fit.
     pub room: (usize, usize),
     pub background: [u8; 3],
+    /// Whether it is the card of the file (kind, size, EXIF) and not the picture.
+    pub info: bool,
     pub length: u64,
     pub modified: Option<SystemTime>,
 }
@@ -80,6 +82,7 @@ mod tests {
             path: PathBuf::from(name),
             room: (100, 50),
             background: [0, 0, 128],
+            info: false,
             length: 1,
             modified: None,
         }
@@ -108,6 +111,7 @@ mod tests {
                 background: [0, 0, 0],
                 ..key("a")
             },
+            Key { info: true, ..key("a") },
             Key { length: 2, ..key("a") },
             Key {
                 modified: Some(SystemTime::UNIX_EPOCH),

@@ -137,6 +137,11 @@ impl Image {
         Self { levels: vec![picture] }
     }
 
+    /// A picture of one clear pixel, for a file that is shown as a card and has no picture of its own.
+    pub fn blank() -> Self {
+        Self::new(RgbaImage::new(1, 1))
+    }
+
     pub fn size(&self) -> Size {
         self.levels.first().map_or((0, 0), RgbaImage::dimensions)
     }

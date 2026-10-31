@@ -32,6 +32,8 @@ pub enum DecodeError {
     TooLarge,
     /// Not there, not a picture this program reads, or damaged; the text says which.
     Unreadable(String),
+    /// A file that is no picture, which a viewer skips (a font, an archive, a program): not an error to report.
+    NotAPicture,
 }
 
 impl fmt::Display for DecodeError {
@@ -40,6 +42,7 @@ impl fmt::Display for DecodeError {
             Self::NoRoom => f.write_str("no room"),
             Self::TooLarge => f.write_str("too large (over 100 megapixels)"),
             Self::Unreadable(why) => f.write_str(why),
+            Self::NotAPicture => f.write_str("not a picture"),
         }
     }
 }
@@ -236,11 +239,35 @@ pub fn to_picture(img: &RgbaImage) -> Picture {
     }
 }
 
+/// Lays the pixels (`0xAARRGGBB`) over `background`: each becomes opaque, a half clear one half its own colour and half the
+/// background's. A Sixel picture has no half-clear pixel, so this is what makes a soft shadow or a half-clear shape look as
+/// it should.
+pub fn composite_over(argb: &mut [u32], background: [u8; 3]) {
+    let [br, bg, bb] = background;
+    for p in argb {
+        let a = *p >> 24;
+        if a < 255 {
+            let mix = |shift: u32, back: u8| (((*p >> shift) & 255) * a + u32::from(back) * (255 - a) + 127) / 255;
+            *p = 0xFF00_0000 | mix(16, br) << 16 | mix(8, bg) << 8 | mix(0, bb);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)] // a test that cannot decode its own fixture should stop at once
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn composite_over_mixes_by_the_alpha_and_leaves_an_opaque_pixel_alone() {
+        let mut pixels = [0xFF11_2233, 0x0000_0000, 0x80FF_0000, 0x00FF_FFFF];
+        composite_over(&mut pixels, [0, 0, 128]);
+        assert_eq!(pixels[0], 0xFF11_2233, "opaque: as it was");
+        assert_eq!(pixels[1], 0xFF00_0080, "clear: the background");
+        assert_eq!(pixels[2], 0xFF80_0040, "half clear red over blue: half and half");
+        assert_eq!(pixels[3], 0xFF00_0080, "clear whatever its colour");
+    }
 
     fn image_path(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

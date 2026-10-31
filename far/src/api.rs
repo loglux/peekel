@@ -290,11 +290,11 @@ const CONSOLE_COLOURS: [[u8; 3]; 16] = [
 ];
 
 impl FarColor {
-    /// The background as red, green, blue. For an index this is the console's default palette, which the terminal may
-    /// have changed: a guess.
+    /// The background as red, green, blue. For an index it is what the terminal said that colour is, or until it has
+    /// said, the console's default palette (a guess: the terminal may have changed it).
     pub fn background_rgb(&self) -> [u8; 3] {
         if self.flags & FCF_BG_4BIT != 0 {
-            CONSOLE_COLOURS[(self.background & 15) as usize]
+            crate::cell::palette_colour(self.background).unwrap_or(CONSOLE_COLOURS[(self.background & 15) as usize])
         } else {
             let c = self.background;
             [c as u8, (c >> 8) as u8, (c >> 16) as u8]
