@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-![Far Manager: картинка в быстром просмотре, нарисованная плагином Peekel](docs/images/far-quickview.png)
+![Far Manager: картинка в быстром просмотре, нарисованная плагином Peekel](docs/images/far-quickview-v2.png)
 
 **Peekel это плагин быстрого просмотра для Far Manager**: нажмите Ctrl+Q и увидите в панели, что это за файл: картинку, SVG, PDF,
 начало файла Word, PowerPoint или Excel, карточку для шрифтов, программ и архивов.
@@ -27,31 +27,31 @@ Far Manager, быстрый просмотр (Ctrl+Q) с плагином. Об�
 
 **Документ Word**
 
-![Документ Word в быстром просмотре Far](docs/images/far-word.png)
+![Документ Word в быстром просмотре Far](docs/images/far-word-v2.png)
 
 **Лист Excel**
 
-![Лист Excel в быстром просмотре Far](docs/images/far-excel.png)
+![Лист Excel в быстром просмотре Far](docs/images/far-excel-v2.png)
 
 **Слайд PowerPoint**
 
-![Слайд PowerPoint в быстром просмотре Far](docs/images/far-powerpoint.png)
+![Слайд PowerPoint в быстром просмотре Far](docs/images/far-powerpoint-v2.png)
 
 **PDF**
 
-![Обложка PDF-брошюры в быстром просмотре Far](docs/images/far-pdf.png)
+![Обложка PDF-брошюры в быстром просмотре Far](docs/images/far-pdf-v2.png)
 
 **Архив ZIP: что внутри**
 
-![Карточка архива ZIP в быстром просмотре Far](docs/images/far-zip.png)
+![Карточка архива ZIP в быстром просмотре Far](docs/images/far-zip-v2.png)
 
 **Шрифт его же буквами**
 
-![Карточка шрифта в быстром просмотре Far](docs/images/far-font.png)
+![Карточка шрифта в быстром просмотре Far](docs/images/far-font-v2.png)
 
 **Файл, по имени которого ничего не понять, узнан по содержимому**
 
-![Файл 61000000file.chk, распознанный как документ Word: размер, даты, заголовок и автор](docs/images/far-recovered.png)
+![Файл 61000000file.chk, распознанный как документ Word: размер, даты, заголовок и автор](docs/images/far-recovered-v2.png)
 
 ## Что показывает
 

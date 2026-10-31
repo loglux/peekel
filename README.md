@@ -2,7 +2,7 @@
 
 [Русская версия](README.ru.md)
 
-![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview.png)
+![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview-v2.png)
 
 **Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, the
 start of a Word, PowerPoint or Excel file, and a card for fonts, programs and archives.
@@ -28,31 +28,31 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 
 **A Word document**
 
-![A Word document in the quick view of Far](docs/images/far-word.png)
+![A Word document in the quick view of Far](docs/images/far-word-v2.png)
 
 **An Excel sheet**
 
-![An Excel sheet in the quick view of Far](docs/images/far-excel.png)
+![An Excel sheet in the quick view of Far](docs/images/far-excel-v2.png)
 
 **A PowerPoint slide**
 
-![A PowerPoint slide in the quick view of Far](docs/images/far-powerpoint.png)
+![A PowerPoint slide in the quick view of Far](docs/images/far-powerpoint-v2.png)
 
 **A PDF**
 
-![The cover of a PDF brochure in the quick view of Far](docs/images/far-pdf.png)
+![The cover of a PDF brochure in the quick view of Far](docs/images/far-pdf-v2.png)
 
 **A ZIP archive: what is inside**
 
-![The card of a ZIP archive in the quick view of Far](docs/images/far-zip.png)
+![The card of a ZIP archive in the quick view of Far](docs/images/far-zip-v2.png)
 
 **A font, in its own letters**
 
-![The card of a font in the quick view of Far](docs/images/far-font.png)
+![The card of a font in the quick view of Far](docs/images/far-font-v2.png)
 
 **A file whose name says nothing, recognised by its content**
 
-![A file called 61000000file.chk, recognised as a Word document: size, dates, title and author](docs/images/far-recovered.png)
+![A file called 61000000file.chk, recognised as a Word document: size, dates, title and author](docs/images/far-recovered-v2.png)
 
 ## What it shows
 
