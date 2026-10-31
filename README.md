@@ -50,6 +50,10 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 
 ![The card of a font in the quick view of Far](docs/images/far-font-v2.png)
 
+**A photo: Ctrl+Alt+I shows the card with its EXIF**
+
+![The card of a photo in the quick view of Far: camera, lens, date, exposure](docs/images/far-photo-card-v2.png)
+
 **A file whose name says nothing, recognised by its content**
 
 ![A file called 61000000file.chk, recognised as a Word document: size, dates, title and author](docs/images/far-recovered-v2.png)
