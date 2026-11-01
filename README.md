@@ -75,6 +75,19 @@ previews, not copies**: words are wrapped by a guess, and charts, text boxes, he
 Text in SVGs and documents is drawn with the fonts installed on the machine; a document that names a font that is not installed
 gets another one.
 
+### Formats from Windows (WIC)
+
+HEIC, AVIF, JPEG XR, DDS, icons and similar files are opened by the codecs of **your Windows** (the Windows Imaging Component,
+WIC), not by Peekel's own code. So what opens depends on the PC: Windows has some codecs itself (JPEG XR, DDS, icons and others),
+and others are extensions from the Microsoft Store (HEIF, JPEG XL and others) that may not be installed.
+
+- **What your PC opens:** in Far, the menu Commands, Plugin commands, "Peekel: formats" lists it. (F11 opens the same menu, but
+  Windows Terminal takes F11 for full screen.)
+- **When there is no codec:** the card of a HEIC, AVIF or JPEG XL file says so and names the Microsoft Store extension that may
+  add one. While that card is shown, **Ctrl+Alt+S** opens the Store on the page of that extension; whether to install it is
+  yours to decide, Peekel installs nothing.
+- What Peekel reads itself (PNG, JPEG, RAW by its preview and the rest of the table above) does not depend on any of this.
+
 ## Install
 
 Take the archive of the [latest release](../../releases/latest): `Peekel-<version>-windows-x64.zip`. It has a `.sha256` file:
