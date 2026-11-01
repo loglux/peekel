@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::api::{InputRecord, KEY_EVENT, WINDOW_BUFFER_SIZE_EVENT};
 use crate::draw;
 use crate::log;
+use crate::realcell;
 
 /// What a cell is taken as when nothing is known: the default of Windows Terminal's font at 100 % scaling.
 const DEFAULT: (usize, usize) = (10, 20);
@@ -32,6 +33,9 @@ const EVERY: Duration = Duration::from_secs(15);
 
 /// The size last told by the terminal, width << 16 | height; 0 while unknown.
 static MEASURED: AtomicU32 = AtomicU32::new(0);
+/// The real size of a cell, width << 16 | height, when it is another shape than the terminal tells (`realcell`); 0 when it is not
+/// known, or is the same shape.
+static REAL: AtomicU32 = AtomicU32::new(0);
 /// The console was resized since the last question about the cell.
 static RESIZED: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
@@ -149,6 +153,45 @@ pub fn current() -> (usize, usize) {
     }
 }
 
+/// From `PEEKEL_REAL_CELL` (`13x28`): the real size of a cell given by hand, where it cannot be worked out.
+fn given_real() -> Option<(usize, usize)> {
+    let v = std::env::var("PEEKEL_REAL_CELL").ok()?;
+    let (w, h) = v.split_once('x')?;
+    plausible(w.parse().ok()?, h.parse().ok()?)
+}
+
+/// The real size of a cell, when it is another shape than the one the terminal tells: a picture made for the cells of the terminal's
+/// size is stretched by Windows Terminal over real cells, so for a font whose cell is not 1 : 2 it is made for the real shape and
+/// drawn for the told one (`draw.rs`). None when the two are the same shape, or the real one is not known (`PEEKEL_OFF=aspect`
+/// switches this off).
+pub fn real() -> Option<(usize, usize)> {
+    if crate::draw::off("aspect") {
+        return None;
+    }
+    match REAL.load(Ordering::SeqCst) {
+        0 => None,
+        packed => Some(((packed >> 16) as usize, (packed & 0xFFFF) as usize)),
+    }
+}
+
+/// Works the real size of a cell out again (the window, the font or the scale may have changed).
+fn look_at_the_window() {
+    let told = current();
+    let real = given_real()
+        .or_else(realcell::measure)
+        .filter(|&real| realcell::differs(told, real));
+    let packed = real.map_or(0, |(w, h)| (w as u32) << 16 | h as u32);
+    if REAL.swap(packed, Ordering::SeqCst) != packed {
+        match real {
+            Some((w, h)) => log::line(&format!(
+                "the real cell is {w}x{h} px, not the shape of {}x{} that the terminal tells: pictures are made for it",
+                told.0, told.1
+            )),
+            None => log::line("the real cell is the shape the terminal tells, or is not known"),
+        }
+    }
+}
+
 /// The size an answer `ESC [ 6 ; height ; width t` tells, as (width, height), if it is a whole sane one.
 fn parse_answer(text: &str) -> Option<(usize, usize)> {
     let inner = text.strip_prefix("\x1b[6;")?.strip_suffix('t')?;
@@ -252,7 +295,9 @@ pub fn takes(record: &InputRecord) -> bool {
             match cell {
                 Some((w, h)) => {
                     let packed = (w as u32) << 16 | h as u32;
-                    if MEASURED.swap(packed, Ordering::SeqCst) != packed {
+                    let changed = MEASURED.swap(packed, Ordering::SeqCst) != packed;
+                    look_at_the_window();
+                    if changed {
                         log::line(&format!("the terminal says a cell is {w}x{h} px"));
                     }
                 }

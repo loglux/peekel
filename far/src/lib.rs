@@ -15,6 +15,7 @@ mod cell;
 mod draw;
 mod formats;
 mod log;
+mod realcell;
 mod wic;
 
 use std::ffi::c_void;

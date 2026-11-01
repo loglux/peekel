@@ -78,6 +78,8 @@ struct Target {
     rect: (i32, i32, i32, i32),
     /// The cell the picture is made for: when the terminal tells another, the picture is made again.
     cell: (usize, usize),
+    /// The real cell, when it is another shape than that (see `cell::real`): the picture is made again when it changes.
+    real: Option<(usize, usize)>,
     /// Whether the file is a copy Far took out of a plugin's panel (an archive): the panel's neighbours are then no files.
     from_plugin: bool,
     /// The card of the file (kind, size, EXIF) is shown in place of the picture (Ctrl+Alt+I).
@@ -189,7 +191,7 @@ fn note(text: String) {
 /// (it does not look at the viewer's events), `ahead` (no picture is made ahead) and `hex` (a picture or another
 /// binary file is not shown as hex in the quick view), `blank` (hex and not nothing) and `redraw` (the picture is not
 /// written again after a dialog or menu).
-fn off(part: &str) -> bool {
+pub(crate) fn off(part: &str) -> bool {
     std::env::var("PEEKEL_OFF").is_ok_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case(part)))
 }
 
@@ -277,8 +279,10 @@ pub fn describe() -> String {
     let (w, h) = cell();
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".into());
     format!(
-        "cell {w}x{h} px, PEEKEL_CELL={}, PEEKEL_OFF={}, WT_SESSION set: {}, TERM_PROGRAM={}",
+        "cell {w}x{h} px, real cell {:?}, PEEKEL_CELL={}, PEEKEL_REAL_CELL={}, PEEKEL_OFF={}, WT_SESSION set: {}, TERM_PROGRAM={}",
+        crate::cell::real(),
         var("PEEKEL_CELL"),
+        var("PEEKEL_REAL_CELL"),
         var("PEEKEL_OFF"),
         std::env::var_os("WT_SESSION").is_some(),
         var("TERM_PROGRAM")
@@ -540,6 +544,7 @@ pub fn tick() {
         path,
         rect: (left, top, right, bottom),
         cell: cell(),
+        real: crate::cell::real(),
         from_plugin,
         info,
         background: api::panel_colour().map_or([0, 0, 0], |c| c.background_rgb()),
@@ -749,7 +754,9 @@ fn begin(state: &mut State, want: Target) {
         note(format!("cannot wipe: {e}"));
     }
     let background = want.background;
-    let cell = cell();
+    // the room in the pixels of the real cell, when that is another shape than the one the terminal tells: the terminal stretches
+    // a Sixel picture over real cells
+    let cell = crate::cell::real().unwrap_or_else(cell);
     let room = (cols * cell.0, rows * cell.1);
     let wanted = key_of(&want.path, room, background, want.info);
     let hit = CACHE.lock().ok().and_then(|mut cache| cache.get(&wanted));
@@ -891,6 +898,22 @@ fn work(generation: u64, wanted: Option<Key>, neighbours: &[Key], background: [u
     }
 }
 
+/// The picture, made for the real cells, made again for the cells the terminal tells (when the real ones are another shape): the
+/// terminal stretches it back over the real cells, so each side is changed by the ratio of the two sizes and what is seen has the
+/// proportions of the picture, whatever the font.
+fn squeeze(image: image::RgbaImage) -> image::RgbaImage {
+    let Some((real_w, real_h)) = crate::cell::real() else {
+        return image;
+    };
+    let (told_w, told_h) = cell();
+    let side = |n: u32, told: usize, real: usize| ((n as usize * told + real / 2) / real).max(1) as u32;
+    let (w, h) = (
+        side(image.width(), told_w, real_w),
+        side(image.height(), told_h, real_h),
+    );
+    image::imageops::resize(&image, w, h, image::imageops::FilterType::Triangle)
+}
+
 /// The picture of `key`, from the cache or made now (and kept). `current` says whether anyone still wants it.
 fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Arc<Rendered>, String> {
     if let Some(found) = CACHE.lock().ok().and_then(|mut cache| cache.get(key)) {
@@ -918,7 +941,7 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     if !current() {
         return Err("not wanted any more".to_string());
     }
-    let mut picture = decode::to_picture(&decode::fit(image, key.room.0, key.room.1));
+    let mut picture = decode::to_picture(&squeeze(decode::fit(image, key.room.0, key.room.1)));
     // what is clear is shown in the panel's own colour, not black
     let [br, bg, bb] = background;
     decode::composite_over(&mut picture.argb, background);
