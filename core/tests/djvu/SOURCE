@@ -1,0 +1,5 @@
+Made for Peekel (1 November 2026); core/tests/djvu.rs uses it. No licence question.
+
+ramp.djvu  a one-page DjVu file of 72 x 72 pixels whose only picture is a grey background of 24 x 24 pixels, a ramp (the value rises
+           3 per row and 9 per column), made by the IW44 encoder of djvu-rs (MIT) with tools/experiments/djvu-eval/up-vectors; the
+           page is 3 times as big as the picture. DjVuLibre's ddjvu makes the same pixels of it (tests of peekel-djvu keep the hash).

@@ -62,6 +62,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("gif", "GIF"),
     ("webp", "WebP"),
     ("pdf", "PDF"),
+    ("djvu", "DjVu"),
+    ("djv", "DjVu"),
     ("zip", "ZIP"),
     ("7z", "7-Zip"),
     ("rar", "RAR"),
@@ -201,6 +203,15 @@ pub fn of(path: &Path) -> Info {
         picture(path, &head, size, &mut info.rows);
     } else if info.kind.contains("image") || info.kind == "SVG drawing" {
         picture(path, &head, None, &mut info.rows);
+    } else if info.kind == "DjVu document" {
+        // a book is often bigger than the limit for reading a file whole: the pages are counted from the file itself
+        let rows = match &whole {
+            Some(bytes) => crate::djvu::properties(bytes),
+            None => crate::guard::read_limited(path, crate::djvu::MAX_BYTES)
+                .map(|bytes| crate::djvu::properties(&bytes))
+                .unwrap_or_default(),
+        };
+        info.rows.extend(rows);
     } else if info.kind == "PDF document" {
         if let Some(bytes) = whole {
             info.rows.extend(crate::pdf::properties(bytes));

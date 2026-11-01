@@ -4,7 +4,7 @@
 
 ![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview-v2.png)
 
-**Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, the
+**Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, a DjVu book, the
 start of a Word, PowerPoint or Excel file, and a card for fonts, programs and archives.
 
 A console viewer (for F3, Linux and Midnight Commander) works and is being prepared; it will be published a little later.
@@ -15,7 +15,7 @@ A console viewer (for F3, Linux and Midnight Commander) works and is being prepa
   over the files.
 - **No second window.** Peekel draws with Sixel graphics inside the terminal's own cells, so nothing floats over the console
   and has to be kept in place, and it works over SSH too.
-- **More than pictures.** A PDF, the start of a Word, PowerPoint or Excel file, a card for a font (in its own letters), a
+- **More than pictures.** A PDF, a DjVu book, the start of a Word, PowerPoint or Excel file, a card for a font (in its own letters), a
   program, a ZIP: the kind, size, dates, what is inside. When the name says nothing (a recovered `.chk` fragment) it tells what a
   file is by its content, and it warns when a name and the content disagree.
 - **Damaged files are safe.** The size, the time and the depth of reading are limited; a broken file gives a message, not a
@@ -66,6 +66,7 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | RAW photographs (NEF, CR2, ARW, DNG, ORF, PEF and others) | the camera's own JPEG preview (the full size in most files), in a few tenths of a second |
 | HEIC, AVIF, JPEG XL, JPEG XR, DDS and whatever else **your Windows** has a codec for | the picture, only where the codec is installed (Windows' own codecs; the menu Commands, Plugin commands, "Peekel: formats" lists what yours has) |
 | PDF (text pages and scans; not password-protected) | the first page |
+| DjVu (scanned books) | the first page; the card gives the number of pages and the size of the page (read by a reader of our own, written from the format's open specification; not read yet: the JPEG layers and the Fax G4 mask of a page (there were no sample files to check them against), the text layer, and documents whose pages are separate files) |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
 | Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |
@@ -98,7 +99,7 @@ longer developed.
 Close Far and run `install.ps1` from the archive. It finds your Far; if it finds none or several, say which:
 `.\install.ps1 -Far 'C:\Tools\Far'`. `-Uninstall` removes the plugin, `-WhatIf` shows what would be done. By hand: copy the folder
 `Peekel` into the `Plugins` folder next to `Far.exe` (or into `%APPDATA%\Far Manager\Profile\Plugins`). Start Far, press Ctrl+Q
-and move over files.
+and move over files. Peekel may conflict with other plugins that handle quick view (Ctrl+Q).
 
 From source: install Rust (the version is in `rust-toolchain.toml`) and run `cargo build --release -p peekel-far`; the plugin is
 `target/release/peekel_far.dll`.
@@ -116,8 +117,7 @@ variable before starting Far:
 | `PEEKEL_OFF=hook` | switches the plugin off without removing it |
 | `PEEKEL_CELL=10x20` | the size of a terminal cell in pixels, when the terminal cannot be asked |
 
-If another picture plugin is installed, switch off its quick view processing, or both will try to draw. There is no settings
-dialog yet; if you want to turn something off, say which.
+There is no settings dialog yet; if you want to turn something off, say which.
 
 ## Licence
 

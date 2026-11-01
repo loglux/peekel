@@ -898,7 +898,7 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     }
     // a file that is no picture, or one that cannot be read as one (a cut PNG, an encrypted PDF), gets a card
     let decoded = if is_picture(&key.path) && !key.info {
-        decode::decode_full(&key.path)
+        decode::decode_for_room(&key.path, key.room.0, key.room.1)
             .or_else(|first| read_by_windows(&key.path, key.room, first))
             .map_err(|e| {
                 log::line(&format!("{}: {e}: a card instead", key.path.display()));

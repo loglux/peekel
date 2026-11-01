@@ -18,6 +18,7 @@ pub const OLE_COMPOUND: &str = "OLE compound file (old Office document, installe
 /// How the start of a file tells its kind: (offset, bytes, name). The first that matches wins.
 const SIGNS: &[(usize, &[u8], &str)] = &[
     (0, b"%PDF-", "PDF document"),
+    (0, b"AT&TFORM", "DjVu document"),
     (0, b"\xff\xd8\xff", "JPEG image"),
     (0, b"\x89PNG\r\n\x1a\n", "PNG image"),
     (0, b"GIF87a", "GIF image"),

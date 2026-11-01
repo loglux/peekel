@@ -6,6 +6,7 @@ pub mod archive;
 pub mod card;
 pub mod color;
 pub mod decode;
+pub mod djvu;
 pub mod docx;
 pub mod exif;
 pub mod font;

@@ -1,0 +1,14 @@
+# DjVu, read from the public specification (DjVu v3, sndjvu.org/spec.html): safe code only, no dependencies yet.
+# docs/internal/djvu.md has why this is written here and not taken from a library.
+[package]
+name = "peekel-djvu"
+description = "Read DjVu files: the IFF container, the page structure, and (in later steps) the JB2 and IW44 pictures"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

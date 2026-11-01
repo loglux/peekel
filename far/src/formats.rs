@@ -139,7 +139,7 @@ pub fn text(codecs: Option<&[Codec]>, version: &str) -> String {
     out.extend(wrap(
         "  ",
         "  ",
-        &words("PNG JPEG GIF BMP WebP TIFF SVG  PDF  Word, PowerPoint, Excel (docx pptx xlsx)"),
+        &words("PNG JPEG GIF BMP WebP TIFF SVG  PDF  DjVu  Word, PowerPoint, Excel (docx pptx xlsx)"),
     ));
     out.extend(wrap(
         "  RAW photographs, by the camera's own JPEG preview:",

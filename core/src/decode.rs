@@ -54,7 +54,11 @@ pub fn decode(path: &Path, max_width: usize, max_height: usize) -> Result<Pictur
     if max_width == 0 || max_height == 0 {
         return Err(DecodeError::NoRoom);
     }
-    Ok(to_picture(&fit(decode_full(path)?, max_width, max_height)))
+    Ok(to_picture(&fit(
+        decode_for_room(path, max_width, max_height)?,
+        max_width,
+        max_height,
+    )))
 }
 
 /// A format that the `image` crate does not read, with its own module: how its name is recognised and how a file of it
@@ -64,7 +68,7 @@ struct Special {
     draw: fn(&Path) -> Result<RgbaImage, DecodeError>,
 }
 
-const SPECIAL: [Special; 6] = [
+const SPECIAL: [Special; 7] = [
     Special {
         is: crate::raw::is_raw,
         draw: crate::raw::render,
@@ -76,6 +80,10 @@ const SPECIAL: [Special; 6] = [
     Special {
         is: crate::pdf::is_pdf,
         draw: crate::pdf::render_first_page,
+    },
+    Special {
+        is: crate::djvu::is_djvu,
+        draw: crate::djvu::render_first_page,
     },
     Special {
         is: crate::docx::is_docx,
@@ -96,6 +104,16 @@ pub fn is_special(path: &Path) -> bool {
     SPECIAL.iter().any(|s| (s.is)(path))
 }
 
+/// As [`decode_full`], but a DjVu page (a scan of 10 to 20 million pixels) is made at a size not smaller than the box when the box is
+/// at least twice as small, which is far less work than the page whole; the caller shrinks the picture to the box (see [`fit`]).
+/// Any other file is read at its own size.
+pub fn decode_for_room(path: &Path, max_width: usize, max_height: usize) -> Result<RgbaImage, DecodeError> {
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::render_within(path, max_width, max_height);
+    }
+    decode_full(path)
+}
+
 /// Reads `path` and turns it upright, at its own size.
 pub fn decode_full(path: &Path) -> Result<RgbaImage, DecodeError> {
     if let Some(special) = SPECIAL.iter().find(|s| (s.is)(path)) {
@@ -104,11 +122,14 @@ pub fn decode_full(path: &Path) -> Result<RgbaImage, DecodeError> {
     decode_reader(ImageReader::open(path).map_err(unreadable)?, MAX_PIXELS, 1)
 }
 
-/// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF has many, anything else one
+/// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF or a DjVu file has many, anything else one
 /// (and `page` is not looked at). A page past the end is the last.
 pub fn decode_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), DecodeError> {
     if crate::pdf::is_pdf(path) {
         return crate::pdf::render_page(path, page);
+    }
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::render_page(path, page);
     }
     decode_full(path).map(|image| (image, 1))
 }

@@ -13,6 +13,7 @@ publish.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
 # already in the tree (png and usvg use it): gzipped SVGs are unpacked here, with a limit, not by usvg without one
 flate2 = "1.1"
+peekel-djvu = { path = "../djvu" }
 moxcms = "0.8.1"
 hayro = "0.8.0"
 # already in the tree (hayro uses it): the names, weight and letters of a font file
