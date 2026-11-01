@@ -32,6 +32,90 @@ fn is_transparent(argb: u32) -> bool {
     argb >> 24 < 128
 }
 
+/// A palette made once for a whole picture (from a small copy of it), for the frames shown while it is moved: the colours
+/// are the picture's own and stay the same from frame to frame, and a pixel's colour is a lookup, so a frame costs next to
+/// nothing; dithering is left out, or is the cheap ordered kind (a fixed pattern added to the pixel, no error to carry).
+pub struct Steady {
+    palette: Vec<u32>,
+    palette_lab: Vec<[f32; 3]>,
+    lab: LabTable,
+    /// The palette index of each colour of 6 bits a channel that has turned up (`u8::MAX`: not yet).
+    lookup: Vec<u8>,
+}
+
+impl std::fmt::Debug for Steady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Steady")
+            .field("colours", &self.palette.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The 4 x 4 pattern of ordered dithering, as offsets from -7.5 to 7.5 (times the strength asked for, per 16).
+const BAYER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+impl Steady {
+    /// The palette of `sample`, pixels (`0xAARRGGBB`) of a small copy of the whole picture; None for a picture of few
+    /// colours (its frames are exact as they are).
+    pub fn new(sample: &[u32]) -> Option<Self> {
+        if exact_palette(sample).is_some() {
+            return None;
+        }
+        let palette = make_palette(sample);
+        let lab = LabTable::new();
+        let palette_lab = palette.iter().map(|&c| lab.of(c)).collect();
+        Some(Self {
+            palette,
+            palette_lab,
+            lab,
+            lookup: vec![u8::MAX; 1 << 18],
+        })
+    }
+
+    /// Pixels (`width` to a row) as palette indexes. `dither` is the strength of the ordered dithering in levels of a channel
+    /// (0 for none; 8 is mild).
+    pub fn quantize(&mut self, argb: &[u32], width: usize, dither: i32) -> Indexed {
+        let mut index = Vec::with_capacity(argb.len());
+        for (i, &p) in argb.iter().enumerate() {
+            if is_transparent(p) {
+                index.push(BACKGROUND);
+                continue;
+            }
+            let offset = if dither == 0 || width == 0 {
+                0
+            } else {
+                (BAYER[(i / width) & 3][(i % width) & 3] * 2 - 15) * dither / 16
+            };
+            let channel = |shift: u32| {
+                u8::try_from((i32::try_from((p >> shift) & 255).unwrap_or(0) + offset).clamp(0, 255)).unwrap_or(0)
+            };
+            index.push(self.nearest([channel(16), channel(8), channel(0)]));
+        }
+        Indexed {
+            index,
+            palette: self.palette.clone(),
+        }
+    }
+
+    fn nearest(&mut self, p: [u8; 3]) -> u8 {
+        let bin = (usize::from(p[0]) >> 2) << 12 | (usize::from(p[1]) >> 2) << 6 | usize::from(p[2]) >> 2;
+        if self.lookup[bin] != u8::MAX {
+            return self.lookup[bin];
+        }
+        let centre = [p[0] >> 2 << 2 | 2, p[1] >> 2 << 2 | 2, p[2] >> 2 << 2 | 2];
+        let l = self.lab.of_rgb(centre);
+        let mut best = (0usize, f32::MAX);
+        for (i, c) in self.palette_lab.iter().enumerate() {
+            let d = (l[0] - c[0]).powi(2) + (l[1] - c[1]).powi(2) + (l[2] - c[2]).powi(2);
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        self.lookup[bin] = u8::try_from(best.0).unwrap_or(0);
+        self.lookup[bin]
+    }
+}
+
 /// Pixels (`0xAARRGGBB`, `width` to a row) as at most 255 colours; a pixel under half opaque is the background.
 pub fn quantize(argb: &[u32], width: usize) -> Indexed {
     if width == 0 {
@@ -290,6 +374,53 @@ mod tests {
             i32::try_from(c >> 8).unwrap_or(0) & 255,
             i32::try_from(c).unwrap_or(0) & 255,
         )
+    }
+
+    #[test]
+    fn a_steady_palette_is_the_pictures_own_and_keeps_the_background() {
+        let (mut pixels, w, _) = sky_and_skin();
+        pixels[0] = 0; // a clear pixel
+        let mut steady = Steady::new(&pixels).expect("a photo has many colours");
+        let frame = steady.quantize(&pixels, w, 0);
+        assert!(frame.palette.len() <= 255);
+        assert_eq!(frame.index[0], BACKGROUND);
+        assert!(
+            frame
+                .index
+                .iter()
+                .all(|&i| usize::from(i) < frame.palette.len() || i == BACKGROUND)
+        );
+        // the colour of a pixel is near its own (no more than a step of the palette away on average)
+        let mut off = 0i64;
+        for (i, &p) in pixels.iter().enumerate().skip(1) {
+            let (r, g, b) = rgb_of(&frame, i);
+            off += i64::from((r - i32::try_from((p >> 16) & 255).unwrap_or(0)).abs())
+                + i64::from((g - i32::try_from((p >> 8) & 255).unwrap_or(0)).abs())
+                + i64::from((b - i32::try_from(p & 255).unwrap_or(0)).abs());
+        }
+        assert!(
+            off / (3 * pixels.len() as i64) < 8,
+            "the mean error of a channel is {}",
+            off / (3 * pixels.len() as i64)
+        );
+    }
+
+    #[test]
+    fn a_steady_palette_is_the_same_for_every_frame_and_dithering_changes_only_the_indexes() {
+        let (pixels, w, _) = sky_and_skin();
+        let mut steady = Steady::new(&pixels).expect("a photo has many colours");
+        let plain = steady.quantize(&pixels, w, 0);
+        let dithered = steady.quantize(&pixels, w, 8);
+        assert_eq!(plain.palette, dithered.palette);
+        assert_ne!(plain.index, dithered.index, "a pattern was added");
+        // the same pixels again: the same indexes
+        assert_eq!(steady.quantize(&pixels, w, 8), dithered);
+    }
+
+    #[test]
+    fn a_picture_of_few_colours_has_no_steady_palette_and_is_drawn_exactly() {
+        let argb = [OPAQUE | 0xFF0000, OPAQUE | 0x00FF00, OPAQUE | 0x123456];
+        assert!(Steady::new(&argb).is_none());
     }
 
     #[test]

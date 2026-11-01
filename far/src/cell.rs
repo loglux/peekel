@@ -14,10 +14,10 @@
 //! asked.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::api::{InputRecord, KEY_EVENT};
+use crate::api::{InputRecord, KEY_EVENT, WINDOW_BUFFER_SIZE_EVENT};
 use crate::draw;
 use crate::log;
 
@@ -32,6 +32,8 @@ const EVERY: Duration = Duration::from_secs(15);
 
 /// The size last told by the terminal, width << 16 | height; 0 while unknown.
 static MEASURED: AtomicU32 = AtomicU32::new(0);
+/// The console was resized since the last question about the cell.
+static RESIZED: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
     waiting_since: None,
     reader: Reader::new(),
@@ -195,6 +197,13 @@ fn plausible(width: usize, height: usize) -> Option<(usize, usize)> {
 
 /// Every input record, before Far has it: true when it is a part of an answer awaited, and is to be taken out.
 pub fn takes(record: &InputRecord) -> bool {
+    if record.event_type == WINDOW_BUFFER_SIZE_EVENT {
+        // the window was resized (or the font zoomed): the cell may be another size, so it is asked about at once, not when
+        // the next look at the panels' frames notices
+        RESIZED.store(true, Ordering::SeqCst);
+        log::line("the console was resized");
+        return false;
+    }
     if record.event_type != KEY_EVENT {
         return false;
     }
@@ -272,7 +281,8 @@ pub fn tick(layout: [i32; 8]) {
         }
         return;
     }
-    let changed = state.layout != Some(layout);
+    let resized = RESIZED.swap(false, Ordering::SeqCst);
+    let changed = resized || state.layout != Some(layout);
     state.layout = Some(layout);
     let due = state.last_asked.is_none_or(|at| now.duration_since(at) >= EVERY);
     let quiet = state.last_key.is_none_or(|at| now.duration_since(at) >= QUIET);

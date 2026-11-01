@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 
-use crate::{ADV_CONTROL, GUID, PANEL_CONTROL, TEXT, VIEWER_CONTROL};
+use crate::{ADV_CONTROL, GUID, PANEL_CONTROL, SEND_DLG_MESSAGE, TEXT, VIEWER_CONTROL};
 
 pub const PF_PRELOAD: u64 = 1;
 const PANEL_ACTIVE: isize = -1;
@@ -110,13 +110,83 @@ pub struct PluginStartupInfo {
     dialog_init: usize,
     dialog_run: usize,
     dialog_free: usize,
-    send_dlg_message: usize,
+    pub send_dlg_message: usize,
     def_dlg_proc: usize,
     pub viewer_control: usize,
 }
 
+const ACTL_SETPROGRESSSTATE: i32 = 21;
+/// `TBPS_INDETERMINATE` of `TASKBARPROGRESSTATE`: a progress with no end in sight; `TBPS_NOPROGRESS` is none.
+const TBPS_INDETERMINATE: isize = 1;
+const TBPS_NOPROGRESS: isize = 0;
+
+/// Shows progress of no known length on the taskbar button (and the tab, in a terminal that shows it) while a picture is made,
+/// or takes it away. Far's own call: it must be made on Far's thread (the tick is).
+pub fn set_progress(busy: bool) {
+    adv(
+        ACTL_SETPROGRESSSTATE,
+        if busy { TBPS_INDETERMINATE } else { TBPS_NOPROGRESS },
+        std::ptr::null_mut(),
+    );
+}
+
+/// `DE_DLGPROCINIT` of `FARDIALOGEVENTS`: Far is about to give the dialog's own procedure a message.
+pub const DE_DLGPROCINIT: isize = 0;
+/// `DN_DRAWDIALOG`: the dialog is about to be painted.
+pub const DN_DRAWDIALOG: isize = 4101;
+/// `DM_GETDLGRECT`: where the dialog is on the screen.
+const DM_GETDLGRECT: isize = 6;
+
+/// What Far gives `ProcessDialogEventW`.
+#[repr(C)]
+pub struct ProcessDialogEventInfo {
+    pub struct_size: usize,
+    pub event: isize,
+    pub param: *const FarDialogEvent,
+    pub instance: *mut c_void,
+}
+
+/// The message of a dialog (`FarDialogEvent`).
+#[repr(C)]
+pub struct FarDialogEvent {
+    pub struct_size: usize,
+    pub dialog: isize,
+    pub msg: isize,
+    pub param1: isize,
+    pub param2: *mut c_void,
+    pub result: isize,
+}
+
+/// `SMALL_RECT`: left, top, right and bottom, from 0, the last row and column inside.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub left: i16,
+    pub top: i16,
+    pub right: i16,
+    pub bottom: i16,
+}
+
+type SendDlgMessageFn = unsafe extern "system" fn(isize, isize, isize, *mut c_void) -> isize;
+
+/// Where a dialog is on the screen (not its shadow), as it is about to be painted.
+pub fn dialog_rect(dialog: isize) -> Option<ScreenRect> {
+    let f = SEND_DLG_MESSAGE.load(Ordering::SeqCst);
+    if f == 0 {
+        return None;
+    }
+    // SAFETY: the address Far gave in `SetStartupInfoW`, a function of this signature; DM_GETDLGRECT fills a SMALL_RECT.
+    let f = unsafe { std::mem::transmute::<usize, SendDlgMessageFn>(f) };
+    let mut rect = ScreenRect::default();
+    // SAFETY: Far's own call, with the handle it gave and a place for a SMALL_RECT.
+    let ok = unsafe { f(dialog, DM_GETDLGRECT, 0, (&raw mut rect).cast()) };
+    (ok != 0).then_some(rect)
+}
+
 /// `KEY_EVENT` of `INPUT_RECORD`.
 pub const KEY_EVENT: u16 = 1;
+/// `WINDOW_BUFFER_SIZE_EVENT` of `INPUT_RECORD`: the console (the terminal's window) was resized.
+pub const WINDOW_BUFFER_SIZE_EVENT: u16 = 4;
 
 /// The Windows `INPUT_RECORD` as a key event has it (the other kinds are not looked into).
 #[repr(C)]
@@ -290,6 +360,11 @@ const CONSOLE_COLOURS: [[u8; 3]; 16] = [
 ];
 
 impl FarColor {
+    /// The background as the console's colour number (0 to 15), when Far gives it as one.
+    pub fn background_index(&self) -> Option<u32> {
+        (self.flags & FCF_BG_4BIT != 0).then_some(self.background & 15)
+    }
+
     /// The background as red, green, blue. For an index it is what the terminal said that colour is, or until it has
     /// said, the console's default palette (a guess: the terminal may have changed it).
     pub fn background_rgb(&self) -> [u8; 3] {

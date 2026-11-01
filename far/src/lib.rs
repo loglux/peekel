@@ -32,6 +32,7 @@ static ADV_CONTROL: AtomicUsize = AtomicUsize::new(0);
 static PANEL_CONTROL: AtomicUsize = AtomicUsize::new(0);
 static TEXT: AtomicUsize = AtomicUsize::new(0);
 static VIEWER_CONTROL: AtomicUsize = AtomicUsize::new(0);
+static SEND_DLG_MESSAGE: AtomicUsize = AtomicUsize::new(0);
 /// A request for `ProcessSynchroEventW` is on its way and has not run yet.
 static SYNCHRO_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -67,7 +68,7 @@ pub unsafe extern "system" fn GetGlobalInfoW(info: *mut GlobalInfo) {
     let info = unsafe { &mut *info };
     info.struct_size = size_of::<GlobalInfo>();
     info.min_far_version = VersionInfo::new(3, 0, 0, 0);
-    info.version = VersionInfo::new(0, 2, 0, 0);
+    info.version = VersionInfo::new(0, 2, 1, 0);
     info.guid = GUID;
     info.title = utf16("Peekel").as_ptr();
     info.description = utf16("A picture in the quick view panel as Sixel").as_ptr();
@@ -81,6 +82,7 @@ pub unsafe extern "system" fn SetStartupInfoW(info: *const PluginStartupInfo) {
     PANEL_CONTROL.store(info.panel_control, Ordering::SeqCst);
     TEXT.store(info.text, Ordering::SeqCst);
     VIEWER_CONTROL.store(info.viewer_control, Ordering::SeqCst);
+    SEND_DLG_MESSAGE.store(info.send_dlg_message, Ordering::SeqCst);
     // nothing that can panic runs outside a guard in a call from Far: a panic must not unwind into it
     let _ = catch_unwind(|| {
         std::panic::set_hook(Box::new(|info| log::line(&format!("panic: {info}"))));
@@ -125,6 +127,20 @@ pub unsafe extern "system" fn ProcessViewerEventW(info: *const ProcessViewerEven
         api::VE_READ => guarded("the viewer's opening", || draw::viewer_opened(info.viewer_id)),
         api::VE_CLOSE => guarded("the viewer's closing", || draw::viewer_closed(info.viewer_id)),
         _ => {}
+    }
+    0
+}
+
+/// A message to a dialog (any dialog, Far's own too), before the dialog has it: when the dialog is about to be painted over
+/// a picture of the quick view, the rest of the picture is wiped round it before Far paints anything.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ProcessDialogEventW(info: *const api::ProcessDialogEventInfo) -> isize {
+    let info = unsafe { &*info };
+    if info.event == api::DE_DLGPROCINIT
+        && let Some(event) = unsafe { info.param.as_ref() }
+        && event.msg == api::DN_DRAWDIALOG
+    {
+        guarded("the dialog event", || draw::dialog_drawn(event.dialog));
     }
     0
 }

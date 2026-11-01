@@ -32,9 +32,43 @@ const REDRAW: Duration = Duration::from_millis(100);
 /// How long after a picture is written it is written once more.
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// How long after a dialog or menu came the rest of the picture is wiped round it a second time (it is wiped at once too).
+const HIDE: Duration = Duration::from_millis(150);
+
 unsafe extern "system" {
     fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
     fn SetConsoleMode(handle: isize, mode: u32) -> i32;
+    fn ReadConsoleOutputW(
+        handle: isize,
+        buffer: *mut CharInfo,
+        size: Coord,
+        origin: Coord,
+        region: *mut SmallRect,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Coord {
+    x: i16,
+    y: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SmallRect {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+}
+
+/// A cell of the console's screen: the character and the colours (the low four bits of the high byte are the background).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CharInfo {
+    ch: u16,
+    attributes: u16,
 }
 
 /// A picture to show and where: the file and the other panel's frame (left, top, right, bottom).
@@ -81,6 +115,14 @@ struct State {
     /// The window on top in Far at the last look (id and type): when it changes, a dialog or menu came or went, and Far
     /// repainted rows of the quick view, so the picture is written again.
     window: Option<(isize, i32)>,
+    /// When what is left of the picture is to be wiped round a dialog or menu that came (see `hide_round_dialog`).
+    hide_at: Option<Instant>,
+    /// The wiping is to be done once more after `HIDE`.
+    hide_again: bool,
+    /// The dialog the picture was wiped round, when Far was about to paint it (so that it is done once for a dialog).
+    hidden_dialog: Option<isize>,
+    /// The progress on the taskbar button is on (a picture is being made and it takes long).
+    progress: bool,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -89,7 +131,22 @@ static STATE: Mutex<State> = Mutex::new(State {
     settled: false,
     began: None,
     window: None,
+    hide_at: None,
+    hide_again: false,
+    hidden_dialog: None,
+    progress: false,
 });
+/// The worker is making the picture the cursor is on (not one for a neighbour made ahead).
+static MAKING: AtomicBool = AtomicBool::new(false);
+/// How long a picture has to take before the taskbar shows progress: a quick one would only make it flash.
+/// `PEEKEL_PROGRESS_MS` sets it (for trying it with a quick picture).
+fn progress_after() -> Duration {
+    let ms = std::env::var("PEEKEL_PROGRESS_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    Duration::from_millis(ms)
+}
 static MADE: Mutex<Option<Made>> = Mutex::new(None);
 /// The pictures made, the ones next to the cursor too (64 MB of Sixel at most).
 static CACHE: Mutex<Cache> = Mutex::new(Cache::new(64 << 20));
@@ -440,9 +497,164 @@ pub fn tick() {
             state.settled = false;
             log::line(&format!("the window on top went from {:?} to {window:?}", state.window));
         }
+        // a dialog or menu is over the panels: what is left of the picture round it is wiped (the picture comes back
+        // when the panels are on top again, by the writing above)
+        // (at once: this runs on Far's thread, after Far has painted the dialog; and again `HIDE` later, in case Far
+        // painted more)
+        let over = window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS);
+        state.hide_at = over.then(Instant::now);
+        state.hide_again = over;
+        if !over {
+            state.hidden_dialog = None;
+        }
         state.window = window;
     }
+    if state.hide_at.is_some_and(|at| Instant::now() >= at) {
+        state.hide_at = None;
+        if !off("hide") {
+            hide_round_dialog(&state);
+        }
+        if state.hide_again {
+            state.hide_again = false;
+            state.hide_at = Some(Instant::now() + HIDE);
+        }
+    }
     show_when_ready(&mut state);
+    // a picture that takes long (a big photo, a PDF) shows progress of no known length on the taskbar button; it goes when the
+    // picture is made, or no longer wanted, or the cursor has left
+    let waiting = !off("progress")
+        && MAKING.load(Ordering::SeqCst)
+        && state.target.is_some()
+        && state.began.is_some_and(|at| at.elapsed() >= progress_after());
+    if waiting != state.progress {
+        api::set_progress(waiting);
+        state.progress = waiting;
+        log::line(&format!("progress on the taskbar button: {waiting}"));
+    }
+}
+
+/// A dialog is about to be painted (Far tells the plugin before it paints): the rest of the picture of the quick view is wiped
+/// round the dialog's box at once, so that Far paints the dialog on a blank panel and no torn picture is ever on the screen.
+/// Done once for a dialog. The menus are not dialogs; the look at the screen in `hide_round_dialog` catches those.
+pub fn dialog_drawn(dialog: isize) {
+    if off("hide") {
+        return;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return;
+    };
+    if state.hidden_dialog == Some(dialog) {
+        return;
+    }
+    let (Some(target), Some(_)) = (state.target.as_ref(), state.written.as_ref()) else {
+        return;
+    };
+    let quick_view = target.rect();
+    let Some(rect) = api::dialog_rect(dialog) else {
+        return log::line("a dialog is about to be painted, but its place is not told");
+    };
+    let Some(keep) = dialog_keep(rect) else {
+        return;
+    };
+    state.hidden_dialog = Some(dialog);
+    log::line(&format!(
+        "a dialog {rect:?} is about to be painted: the picture is wiped round it"
+    ));
+    if let Err(e) = write_console(&erase(quick_view, api::panel_colour().as_ref(), Some(keep))) {
+        note(format!("cannot wipe round the dialog: {e}"));
+    }
+}
+
+/// A dialog's box with its shadow (two columns to the right, a row below) as `erase` takes a place to keep: row, column,
+/// rows and columns, counted from 1.
+fn dialog_keep(rect: api::ScreenRect) -> Option<(usize, usize, usize, usize)> {
+    let (left, top) = (usize::try_from(rect.left).ok()?, usize::try_from(rect.top).ok()?);
+    let (right, bottom) = (usize::try_from(rect.right).ok()?, usize::try_from(rect.bottom).ok()?);
+    (right >= left && bottom >= top).then(|| (top + 1, left + 1, bottom - top + 2, right - left + 3))
+}
+
+/// The rectangle that is not the panel's colour among the cells of the picture's place: a dialog or menu, and its shadow.
+/// `backgrounds` are the background colours of the cells, `cols` to a row; the result is (row, column, rows, columns)
+/// counted from 0 in that grid. A dialog that covers most of the grid is not told from the panel: `panel` is the colour
+/// the panel has.
+fn dialog_box(backgrounds: &[u8], cols: usize, panel: u8) -> Option<(usize, usize, usize, usize)> {
+    if cols == 0 {
+        return None;
+    }
+    let (mut top, mut left, mut bottom, mut right) = (usize::MAX, usize::MAX, 0, 0);
+    for (i, &colour) in backgrounds.iter().enumerate() {
+        if colour == panel {
+            continue;
+        }
+        let (row, col) = (i / cols, i % cols);
+        top = top.min(row);
+        left = left.min(col);
+        bottom = bottom.max(row);
+        right = right.max(col);
+    }
+    (top != usize::MAX).then(|| (top, left, bottom - top + 1, right - left + 1))
+}
+
+/// The background colour (0..16) of each cell of a rectangle of the screen (`left` and `top` from 0), row after row, as Far has
+/// it in the console's own buffer: the pictures are not in it, only what Far wrote.
+fn read_backgrounds(left: usize, top: usize, cols: usize, rows: usize) -> Option<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    let console = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONOUT$")
+        .ok()?;
+    let mut cells = vec![CharInfo::default(); cols * rows];
+    let (left, top) = (i16::try_from(left).ok()?, i16::try_from(top).ok()?);
+    let (width, height) = (i16::try_from(cols).ok()?, i16::try_from(rows).ok()?);
+    let mut region = SmallRect {
+        left,
+        top,
+        right: left + width - 1,
+        bottom: top + height - 1,
+    };
+    // SAFETY: a console handle, a buffer of `cols * rows` cells and the region it holds.
+    let read = unsafe {
+        ReadConsoleOutputW(
+            console.as_raw_handle() as isize,
+            cells.as_mut_ptr(),
+            Coord { x: width, y: height },
+            Coord::default(),
+            &raw mut region,
+        )
+    };
+    (read != 0).then(|| cells.iter().map(|c| ((c.attributes >> 4) & 15) as u8).collect())
+}
+
+/// A dialog or menu is over the panels, and Far has painted its rows of the quick view, which left a torn picture (a band
+/// cut out of it). The panel is wiped round the dialog's rectangle, so that the dialog stands on a blank panel and the
+/// picture comes back, written again, when the panels are on top.
+fn hide_round_dialog(state: &State) {
+    let (Some(target), Some(_)) = (state.target.as_ref(), state.written.as_ref()) else {
+        return;
+    };
+    let rect = target.rect();
+    let Some((cols, rows)) = inside(rect) else {
+        return;
+    };
+    let colour = api::panel_colour();
+    // the panel's colour as the console has it: Far's index follows the console's attribute bits
+    let Some(panel) = colour.as_ref().and_then(|c| u8::try_from(c.background_index()?).ok()) else {
+        return log::line("the panel's colour is no index of the console: the picture is left as it is");
+    };
+    let (Ok(left), Ok(top)) = (usize::try_from(rect.left + 1), usize::try_from(rect.top + 1)) else {
+        return;
+    };
+    let Some(backgrounds) = read_backgrounds(left, top, cols, rows) else {
+        return log::line("cannot read the screen: the picture is left as it is");
+    };
+    let dialog = dialog_box(&backgrounds, cols, panel);
+    log::line(&format!("a dialog over the picture's place: {dialog:?}"));
+    // `erase` counts rows and columns from 1, and the inside of the panel starts at the second row and column
+    let keep = dialog.map(|(row, col, height, width)| (top + row + 1, left + col + 1, height, width));
+    if let Err(e) = write_console(&erase(rect, colour.as_ref(), keep)) {
+        note(format!("cannot wipe round the dialog: {e}"));
+    }
 }
 
 /// A new picture is under the cursor: wipe its place at once, and have the worker make it (unless it was made already
@@ -566,7 +778,10 @@ fn work(generation: u64, wanted: Option<Key>, neighbours: &[Key], background: [u
     let current = || GENERATION.load(Ordering::SeqCst) == generation;
     if let Some(key) = wanted {
         let started = Instant::now();
-        match make(&key, background, &current) {
+        MAKING.store(true, Ordering::SeqCst);
+        let made = make(&key, background, &current);
+        MAKING.store(false, Ordering::SeqCst);
+        match made {
             Ok(picture) if current() => {
                 log::line(&format!(
                     "{generation}: made {}x{} px in {:?}",
@@ -727,6 +942,10 @@ fn release() {
     let Ok(mut state) = STATE.lock() else {
         return;
     };
+    if state.progress {
+        api::set_progress(false);
+        state.progress = false;
+    }
     let Some(old) = state.target.take() else {
         return;
     };
@@ -808,6 +1027,45 @@ fn vt_on(console: &std::fs::File) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dialog_is_kept_with_its_shadow_in_screen_cells_from_1() {
+        // a dialog at columns 20 to 59 and rows 5 to 12 (from 0): it starts at row 6, column 21 (from 1), is 8 rows and 40
+        // columns, and its shadow adds two columns and a row
+        let rect = api::ScreenRect {
+            left: 20,
+            top: 5,
+            right: 59,
+            bottom: 12,
+        };
+        assert_eq!(dialog_keep(rect), Some((6, 21, 9, 42)));
+        let nothing = api::ScreenRect {
+            left: 5,
+            top: 5,
+            right: 4,
+            bottom: 5,
+        };
+        assert_eq!(dialog_keep(nothing), None);
+    }
+
+    #[test]
+    fn a_dialog_is_the_box_of_the_cells_that_are_not_the_panels_colour() {
+        // a grid of 6 columns and 4 rows in colour 1 (blue); a dialog of 3 x 2 cells in colour 7 at row 1, column 2
+        let mut grid = vec![1u8; 24];
+        for row in 1..3 {
+            for col in 2..5 {
+                grid[row * 6 + col] = 7;
+            }
+        }
+        assert_eq!(dialog_box(&grid, 6, 1), Some((1, 2, 2, 3)));
+        // its shadow (colour 0) to the right and below is part of the box
+        grid[3 * 6 + 3] = 0;
+        grid[2 * 6 + 5] = 0;
+        assert_eq!(dialog_box(&grid, 6, 1), Some((1, 2, 3, 4)));
+        // nothing over the panel
+        assert_eq!(dialog_box(&[1; 24], 6, 1), None);
+        assert_eq!(dialog_box(&[], 0, 1), None);
+    }
 
     fn ask_card_for(path: Option<&str>) {
         if let Ok(mut asked) = INFO_FOR.lock() {
