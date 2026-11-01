@@ -64,7 +64,11 @@ struct Special {
     draw: fn(&Path) -> Result<RgbaImage, DecodeError>,
 }
 
-const SPECIAL: [Special; 5] = [
+const SPECIAL: [Special; 6] = [
+    Special {
+        is: crate::raw::is_raw,
+        draw: crate::raw::render,
+    },
     Special {
         is: crate::svg::is_svg,
         draw: crate::svg::render,
@@ -97,7 +101,7 @@ pub fn decode_full(path: &Path) -> Result<RgbaImage, DecodeError> {
     if let Some(special) = SPECIAL.iter().find(|s| (s.is)(path)) {
         return (special.draw)(path);
     }
-    decode_reader(ImageReader::open(path).map_err(unreadable)?, MAX_PIXELS)
+    decode_reader(ImageReader::open(path).map_err(unreadable)?, MAX_PIXELS, 1)
 }
 
 /// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF has many, anything else one
@@ -112,12 +116,19 @@ pub fn decode_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
 /// A picture held in memory (one inside a document), turned upright, at its own size.
 /// One that claims more than `max_pixels` is refused before it is decoded.
 pub fn decode_bytes(bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, DecodeError> {
-    decode_reader(ImageReader::new(std::io::Cursor::new(bytes)), max_pixels)
+    decode_reader(ImageReader::new(std::io::Cursor::new(bytes)), max_pixels, 1)
+}
+
+/// The same for a picture that is a part of another file (the preview of a RAW photograph), which says in its own EXIF
+/// how it is turned, if it does; when it does not, `fallback` is the EXIF orientation (1 to 8) of the file it is in.
+pub(crate) fn decode_bytes_oriented(bytes: &[u8], max_pixels: u64, fallback: u16) -> Result<RgbaImage, DecodeError> {
+    decode_reader(ImageReader::new(std::io::Cursor::new(bytes)), max_pixels, fallback)
 }
 
 fn decode_reader<R: std::io::BufRead + std::io::Seek>(
     reader: ImageReader<R>,
     max_pixels: u64,
+    fallback: u16,
 ) -> Result<RgbaImage, DecodeError> {
     let mut decoder = reader
         .with_guessed_format()
@@ -128,7 +139,14 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
     if u64::from(w) * u64::from(h) > max_pixels.min(MAX_PIXELS) {
         return Err(DecodeError::TooLarge);
     }
-    let orientation = decoder.orientation().map_err(unreadable)?;
+    let mut orientation = decoder.orientation().map_err(unreadable)?;
+    if orientation == image::metadata::Orientation::NoTransforms
+        && let Some(from_file) = u8::try_from(fallback)
+            .ok()
+            .and_then(image::metadata::Orientation::from_exif)
+    {
+        orientation = from_file;
+    }
     let profile = decoder.icc_profile().ok().flatten();
     let mut picture = DynamicImage::from_decoder(decoder).map_err(unreadable)?;
     picture.apply_orientation(orientation);

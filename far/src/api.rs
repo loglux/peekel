@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 
-use crate::{ADV_CONTROL, GUID, PANEL_CONTROL, SEND_DLG_MESSAGE, TEXT, VIEWER_CONTROL};
+use crate::{ADV_CONTROL, GUID, MESSAGE, PANEL_CONTROL, SEND_DLG_MESSAGE, TEXT, VIEWER_CONTROL};
 
 pub const PF_PRELOAD: u64 = 1;
 const PANEL_ACTIVE: isize = -1;
@@ -60,9 +60,9 @@ pub struct GlobalInfo {
 
 #[repr(C)]
 pub struct PluginMenuItem {
-    guids: *const c_void,
-    strings: *const c_void,
-    count: usize,
+    pub guids: *const c_void,
+    pub strings: *const c_void,
+    pub count: usize,
 }
 
 #[repr(C)]
@@ -70,7 +70,7 @@ pub struct PluginInfo {
     pub struct_size: usize,
     pub flags: u64,
     disk_menu: PluginMenuItem,
-    plugin_menu: PluginMenuItem,
+    pub plugin_menu: PluginMenuItem,
     plugin_config: PluginMenuItem,
     command_prefix: *const u16,
     instance: *mut c_void,
@@ -89,7 +89,7 @@ pub struct PluginStartupInfo {
     pub struct_size: usize,
     pub module_name: *const u16,
     menu: usize,
-    message: usize,
+    pub message: usize,
     get_msg: usize,
     pub panel_control: usize,
     save_screen: usize,
@@ -113,6 +113,48 @@ pub struct PluginStartupInfo {
     pub send_dlg_message: usize,
     def_dlg_proc: usize,
     pub viewer_control: usize,
+}
+
+/// `OPEN_PLUGINSMENU` of `OPENFROM`: the plugin was chosen in the plugins menu (F11).
+pub const OPEN_PLUGINSMENU: isize = 1;
+
+/// What Far gives `OpenW`.
+#[repr(C)]
+pub struct OpenInfo {
+    pub struct_size: usize,
+    pub open_from: isize,
+    pub guid: *const [u8; 16],
+    pub data: isize,
+    pub instance: *mut c_void,
+}
+
+/// `FMSG_LEFTALIGN`, `FMSG_ALLINONE` (the items are one string, its lines split at the new lines) and `FMSG_MB_OK`.
+const MESSAGE_FLAGS: u64 = 0x8 | 0x10 | 0x1_0000;
+
+type MessageFn = unsafe extern "system" fn(
+    *const [u8; 16],
+    *const [u8; 16],
+    u64,
+    *const u16,
+    *const *const u16,
+    usize,
+    isize,
+) -> isize;
+
+/// Far's message box with an OK button: the first line of `text` is its title, the rest its lines (split at the new lines).
+/// `id` is the GUID of this box (for Far's settings of boxes); it is shown on Far's own thread, which `OpenW` runs on.
+pub fn message(id: &[u8; 16], text: &str) {
+    let f = MESSAGE.load(Ordering::SeqCst);
+    if f == 0 {
+        return;
+    }
+    // SAFETY: the address Far gave in `SetStartupInfoW`, a function of this signature.
+    let f = unsafe { std::mem::transmute::<usize, MessageFn>(f) };
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    // SAFETY: Far's own call; with FMSG_ALLINONE `Items` is not an array of strings but the one string itself, which lives
+    // through the call.
+    unsafe { f(&GUID, id, MESSAGE_FLAGS, std::ptr::null(), wide.as_ptr().cast(), 1, 0) };
 }
 
 const ACTL_SETPROGRESSSTATE: i32 = 21;

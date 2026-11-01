@@ -13,7 +13,9 @@ mod api;
 mod cache;
 mod cell;
 mod draw;
+mod formats;
 mod log;
+mod wic;
 
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -33,6 +35,10 @@ static PANEL_CONTROL: AtomicUsize = AtomicUsize::new(0);
 static TEXT: AtomicUsize = AtomicUsize::new(0);
 static VIEWER_CONTROL: AtomicUsize = AtomicUsize::new(0);
 static SEND_DLG_MESSAGE: AtomicUsize = AtomicUsize::new(0);
+static MESSAGE: AtomicUsize = AtomicUsize::new(0);
+/// The GUIDs of the item of the plugin in Far's plugins menu (F11) and of the box it shows (made up).
+static MENU_GUID: [u8; 16] = *b"\x53\x49\x58\x56\x49\x45\x57\x01\xa1\xb2\xc3\xd4\xe5\xf6\x07\x19";
+static BOX_GUID: [u8; 16] = *b"\x53\x49\x58\x56\x49\x45\x57\x02\xa1\xb2\xc3\xd4\xe5\xf6\x07\x1a";
 /// A request for `ProcessSynchroEventW` is on its way and has not run yet.
 static SYNCHRO_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -83,6 +89,9 @@ pub unsafe extern "system" fn SetStartupInfoW(info: *const PluginStartupInfo) {
     TEXT.store(info.text, Ordering::SeqCst);
     VIEWER_CONTROL.store(info.viewer_control, Ordering::SeqCst);
     SEND_DLG_MESSAGE.store(info.send_dlg_message, Ordering::SeqCst);
+    MESSAGE.store(info.message, Ordering::SeqCst);
+    // the decoders of this Windows are listed in a thread of their own (a moment)
+    wic::start();
     // nothing that can panic runs outside a guard in a call from Far: a panic must not unwind into it
     let _ = catch_unwind(|| {
         std::panic::set_hook(Box::new(|info| log::line(&format!("panic: {info}"))));
@@ -106,6 +115,25 @@ pub unsafe extern "system" fn GetPluginInfoW(info: *mut PluginInfo) {
     *info = PluginInfo::default();
     info.struct_size = size_of::<PluginInfo>();
     info.flags = api::PF_PRELOAD;
+    // the plugins menu (F11): "Peekel: formats", the box of what the plugin opens on this machine
+    let strings: &'static [*const u16; 1] = Box::leak(Box::new([utf16("Peekel: formats").as_ptr()]));
+    info.plugin_menu = api::PluginMenuItem {
+        guids: (&raw const MENU_GUID).cast(),
+        strings: strings.as_ptr().cast(),
+        count: 1,
+    };
+}
+
+/// The plugin was chosen in the plugins menu: the box of formats is shown, and no panel is opened (nothing is returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn OpenW(info: *const api::OpenInfo) -> *mut c_void {
+    let info = unsafe { &*info };
+    if info.open_from == api::OPEN_PLUGINSMENU {
+        guarded("the formats box", || {
+            api::message(&BOX_GUID, &formats::text(wic::codecs(), env!("CARGO_PKG_VERSION")));
+        });
+    }
+    std::ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]

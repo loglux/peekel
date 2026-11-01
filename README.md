@@ -63,6 +63,8 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | What | In the quick view |
 |---|---|
 | PNG, JPEG, GIF (first frame), BMP, WebP, TIFF, SVG | the picture |
+| RAW photographs (NEF, CR2, ARW, DNG, ORF, PEF and others) | the camera's own JPEG preview (the full size in most files), in a few tenths of a second |
+| HEIC, AVIF, JPEG XL, JPEG XR, DDS and whatever else **your Windows** has a codec for | the picture, only where the codec is installed (Windows' own codecs; **F11, "Peekel: formats"** lists what yours has) |
 | PDF (text pages and scans; not password-protected) | the first page |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |

@@ -82,6 +82,9 @@ struct Target {
     from_plugin: bool,
     /// The card of the file (kind, size, EXIF) is shown in place of the picture (Ctrl+Alt+I).
     info: bool,
+    /// The panel's colour as it is known now: until the terminal has said what Far's blue is, a guess, and the picture is made
+    /// again when the answer comes (a picture made on the guess would have a strip of the wrong colour under it).
+    background: [u8; 3],
 }
 
 impl Target {
@@ -221,11 +224,52 @@ fn shows_something(path: &Path) -> bool {
     }
 }
 
+/// A picture to draw: one that `core` reads, or one that a decoder of this Windows opens (HEIC, AVIF, JPEG XL, ... where the
+/// codec is installed; `wic.rs`).
 fn is_picture(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| PICTURES.iter().any(|p| e.eq_ignore_ascii_case(p)))
+        .is_some_and(|e| PICTURES.iter().any(|p| e.eq_ignore_ascii_case(p)) || crate::wic::supports(e))
         || peekel_core::decode::is_special(path)
+}
+
+/// Whether `core` reads files with this extension by itself (the plain pictures, SVG, PDF, the Office files, RAW by its preview).
+pub fn core_reads(extension: &str) -> bool {
+    let extension = extension.trim_start_matches('.');
+    PICTURES.iter().any(|p| extension.eq_ignore_ascii_case(p))
+        || peekel_core::decode::is_special(Path::new(&format!("x.{extension}")))
+}
+
+/// What a decoder of this Windows makes of a file that `core` did not read, if the extension is one of those: `first` is why
+/// `core` did not. A plain picture `core` knows is not offered to Windows (a damaged PNG is damaged for both); a RAW file with no
+/// preview is.
+fn read_by_windows(
+    path: &Path,
+    room: (usize, usize),
+    first: decode::DecodeError,
+) -> Result<image::RgbaImage, decode::DecodeError> {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let plain = PICTURES.iter().any(|p| extension.eq_ignore_ascii_case(p));
+    if plain || !crate::wic::supports(extension) {
+        return Err(first);
+    }
+    let started = Instant::now();
+    match crate::wic::decode(path, Some(room)) {
+        Ok(image) => {
+            log::line(&format!(
+                "{}: opened by Windows' own codec in {:?}",
+                path.display(),
+                started.elapsed()
+            ));
+            Ok(image)
+        }
+        Err(why) => {
+            if crate::wic::is_component_failure(&why) {
+                crate::wic::mark_failed(extension);
+            }
+            Err(decode::DecodeError::Unreadable(format!("{first}; Windows: {why}")))
+        }
+    }
 }
 
 /// What the plugin knows about its surroundings, for the first line of the log.
@@ -468,6 +512,7 @@ pub fn tick() {
         cell: cell(),
         from_plugin,
         info,
+        background: api::panel_colour().map_or([0, 0, 0], |c| c.background_rgb()),
     };
     crate::cell::tick([
         this.rect.left,
@@ -673,7 +718,7 @@ fn begin(state: &mut State, want: Target) {
     if let Err(e) = write_console(&erase(want.rect(), colour.as_ref(), None)) {
         note(format!("cannot wipe: {e}"));
     }
-    let background = colour.map_or([0, 0, 0], |c| c.background_rgb());
+    let background = want.background;
     let cell = cell();
     let room = (cols * cell.0, rows * cell.1);
     let wanted = key_of(&want.path, room, background, want.info);
@@ -823,16 +868,22 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     }
     // a file that is no picture, or one that cannot be read as one (a cut PNG, an encrypted PDF), gets a card
     let decoded = if is_picture(&key.path) && !key.info {
-        decode::decode_full(&key.path).map_err(|e| {
-            log::line(&format!("{}: {e}: a card instead", key.path.display()));
-            e
-        })
+        decode::decode_full(&key.path)
+            .or_else(|first| read_by_windows(&key.path, key.room, first))
+            .map_err(|e| {
+                log::line(&format!("{}: {e}: a card instead", key.path.display()));
+                e
+            })
     } else {
         Err(decode::DecodeError::NoRoom)
     };
     let image = match decoded {
         Ok(image) => image,
-        Err(_) => card::render(&key.path, key.room.0, key.room.1, background).map_err(|e| e.to_string())?,
+        Err(why) => {
+            let note = crate::formats::codec_hint(&key.path, &why.to_string());
+            card::render_with_note(&key.path, key.room.0, key.room.1, background, note.as_deref())
+                .map_err(|e| e.to_string())?
+        }
     };
     if !current() {
         return Err("not wanted any more".to_string());

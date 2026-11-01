@@ -14,6 +14,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 peekel-core = { path = "../core" }
+# the picture type core's decoders give (no codecs of its own are wanted here)
+image = { version = "0.25.10", default-features = false }
+
+# Windows' own codecs (WIC): HEIC, AVIF, JPEG XL and whatever else is installed on the machine (docs/internal/formats.md)
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com"]
 
 [lints]
 workspace = true

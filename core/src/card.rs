@@ -10,6 +10,11 @@ use crate::decode::DecodeError;
 use crate::svg;
 use crate::xml::escape;
 
+/// What the signature of an OLE compound file says by itself: it is the container of old Word, Excel and PowerPoint files and also
+/// of Windows Installer packages, Outlook messages, Visio and Publisher files and more, so which one it is is for the
+/// extension to say (`info::of`).
+pub const OLE_COMPOUND: &str = "OLE compound file (old Office document, installer, ...)";
+
 /// How the start of a file tells its kind: (offset, bytes, name). The first that matches wins.
 const SIGNS: &[(usize, &[u8], &str)] = &[
     (0, b"%PDF-", "PDF document"),
@@ -27,11 +32,7 @@ const SIGNS: &[(usize, &[u8], &str)] = &[
     (0, b"\x1f\x8b", "gzip archive"),
     (0, b"BZh", "bzip2 archive"),
     (0, b"\xfd7zXZ\x00", "xz archive"),
-    (
-        0,
-        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
-        "Microsoft Office document (old)",
-    ),
+    (0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", OLE_COMPOUND),
     (0, b"SQLite format 3\x00", "SQLite database"),
     (0, b"ID3", "MP3 audio"),
     (0, b"fLaC", "FLAC audio"),
@@ -57,6 +58,17 @@ pub fn kind(head: &[u8]) -> &'static str {
     }
     if head.get(..2) == Some(b"BM") && head.get(6..10) == Some(&[0, 0, 0, 0]) {
         return "BMP image";
+    }
+    // an ISO media file (`ftyp`) is a video, but also a HEIC or AVIF picture or a Canon CR3 photograph: the brand says which
+    if head.get(4..8) == Some(b"ftyp") {
+        return match head.get(8..12) {
+            Some(b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"mif1" | b"msf1") => "HEIF image (HEIC)",
+            Some(b"avif" | b"avis") => "AVIF image",
+            Some(b"crx ") => "Canon CR3 RAW photograph",
+            Some(b"qt  ") => "QuickTime video (MOV)",
+            Some(b"M4A ") => "MP4 audio",
+            _ => "MP4 or MOV video",
+        };
     }
     SIGNS
         .iter()
@@ -158,8 +170,23 @@ fn shorten(name: &str, max: usize) -> String {
 /// read on `background`: its kind, its name, and what `info` knows of it (size, dates, the warning when the name and the
 /// content disagree, the camera of a photograph, the pages of a PDF and so on).
 pub fn render(path: &Path, width: usize, height: usize, background: [u8; 3]) -> Result<RgbaImage, DecodeError> {
+    render_with_note(path, width, height, background, None)
+}
+
+/// `render`, with one more row (`Codec`) when the caller has something to say about the file that the card cannot know, like the
+/// extension of the system that would open it.
+pub fn render_with_note(
+    path: &Path,
+    width: usize,
+    height: usize,
+    background: [u8; 3],
+    note: Option<&str>,
+) -> Result<RgbaImage, DecodeError> {
     std::fs::metadata(path).map_err(|e| DecodeError::Unreadable(e.to_string()))?;
-    let info = crate::info::of(path);
+    let mut info = crate::info::of(path);
+    if let Some(note) = note {
+        info.rows.push(("Codec".to_string(), note.to_string()));
+    }
     let name = path
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -315,6 +342,17 @@ pub fn render_rows(
 #[allow(clippy::expect_used)] // a test that cannot make its fixture should stop at once
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_iso_media_file_is_told_by_its_brand_a_picture_is_no_video() {
+        assert_eq!(kind(b"\0\0\0\x18ftypheic\0\0\0\0"), "HEIF image (HEIC)");
+        assert_eq!(kind(b"\0\0\0\x18ftypmif1\0\0\0\0"), "HEIF image (HEIC)");
+        assert_eq!(kind(b"\0\0\0\x1cftypavif\0\0\0\0"), "AVIF image");
+        assert_eq!(kind(b"\0\0\0\x18ftypcrx \0\0\0\0"), "Canon CR3 RAW photograph");
+        assert_eq!(kind(b"\0\0\0\x14ftypqt  \0\0\0\0"), "QuickTime video (MOV)");
+        assert_eq!(kind(b"\0\0\0\x18ftypisom\0\0\0\0"), "MP4 or MOV video");
+        assert_eq!(kind(b"\0\0\0\x18ftyp"), "MP4 or MOV video");
+    }
 
     #[test]
     fn the_kind_is_told_by_the_first_bytes() {

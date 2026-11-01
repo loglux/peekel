@@ -115,6 +115,26 @@ fn kind_of(head: &[u8], archive: Option<&Archive<'_>>) -> String {
     }
 }
 
+/// Which file an OLE compound container (`card::OLE_COMPOUND`) is, by the extension of `path`; the container alone does not say.
+fn ole_kind(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match extension.as_str() {
+        "doc" | "dot" => "Word document (old)",
+        "xls" | "xlt" | "xla" => "Excel workbook (old)",
+        "ppt" | "pps" | "pot" => "PowerPoint presentation (old)",
+        "msi" | "msp" | "mst" | "msm" => "Windows Installer package",
+        "msg" => "Outlook message",
+        "vsd" => "Visio drawing (old)",
+        "pub" => "Publisher document",
+        "mpp" => "Project plan (old)",
+        _ => card::OLE_COMPOUND,
+    }
+}
+
 /// The properties of the file at `path`.
 pub fn of(path: &Path) -> Info {
     let mut info = Info::default();
@@ -140,6 +160,19 @@ pub fn of(path: &Path) -> Info {
         .filter(|_| head.starts_with(b"PK"))
         .and_then(|b| Archive::new(b).ok());
     info.kind = kind_of(&head, archive.as_ref());
+    if info.kind == card::OLE_COMPOUND {
+        info.kind = ole_kind(path).to_string();
+    }
+    // a RAW file is a TIFF to the eye of its first bytes: the extension says what it is
+    let is_raw = crate::raw::is_raw(path) && head.len() > 4 && (head.starts_with(b"II") || head.starts_with(b"MM"));
+    if is_raw {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        info.kind = format!("RAW photograph ({extension})");
+    }
 
     push(
         &mut info.rows,
@@ -162,8 +195,12 @@ pub fn of(path: &Path) -> Info {
     }
 
     // what the kind has
-    if info.kind.contains("image") || info.kind == "SVG drawing" {
-        picture(path, &head, &mut info.rows);
+    if is_raw {
+        // the picture's size is not IFD0's (a thumbnail): it is the sensor's, the biggest directory of the file
+        let size = whole.as_deref().and_then(crate::raw::find_preview).and_then(|p| p.size);
+        picture(path, &head, size, &mut info.rows);
+    } else if info.kind.contains("image") || info.kind == "SVG drawing" {
+        picture(path, &head, None, &mut info.rows);
     } else if info.kind == "PDF document" {
         if let Some(bytes) = whole {
             info.rows.extend(crate::pdf::properties(bytes));
@@ -223,11 +260,16 @@ fn attributes(meta: &std::fs::Metadata) -> String {
     }
 }
 
-/// The size of a picture and, if it has them, the EXIF rows.
-fn picture(path: &Path, head: &[u8], rows: &mut Vec<(String, String)>) {
-    if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format())
-        && let Ok((w, h)) = reader.into_dimensions()
-    {
+/// The size of a picture (`known`, when the caller knows it better than the file's first directory does) and, if it has them,
+/// the EXIF rows.
+fn picture(path: &Path, head: &[u8], known: Option<(u32, u32)>, rows: &mut Vec<(String, String)>) {
+    let size = known.or_else(|| {
+        image::ImageReader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+    });
+    if let Some((w, h)) = size {
         let megapixels = f64::from(w) * f64::from(h) / 1e6;
         push(rows, "Dimensions", format!("{w} x {h} pixels ({megapixels:.1} MP)"));
     }
@@ -476,6 +518,43 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1000), "1 000");
         assert_eq!(grouped(1_234_567), "1 234 567");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a test that cannot make its file should stop at once
+    fn an_ole_compound_file_is_told_by_its_extension_an_installer_is_no_office_document() {
+        let dir = std::env::temp_dir().join(format!("peekel-ole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let ole = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 the rest of a compound file";
+        for (name, kind) in [
+            ("a.msi", "Windows Installer package"),
+            ("A.MSP", "Windows Installer package"),
+            ("a.doc", "Word document (old)"),
+            ("a.xls", "Excel workbook (old)"),
+            ("a.ppt", "PowerPoint presentation (old)"),
+            ("a.msg", "Outlook message"),
+            ("a.odd", card::OLE_COMPOUND),
+            ("noextension", card::OLE_COMPOUND),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, ole).expect("writes");
+            assert_eq!(of(&path).kind, kind, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a test that cannot make its file should stop at once
+    fn a_raw_file_is_a_raw_photograph_by_its_extension_and_not_a_tiff() {
+        let dir = std::env::temp_dir().join(format!("peekel-rawkind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let tiff = b"II*\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let (nef, plain) = (dir.join("shot.NEF"), dir.join("scan.tif"));
+        std::fs::write(&nef, tiff).expect("writes");
+        std::fs::write(&plain, tiff).expect("writes");
+        assert_eq!(of(&nef).kind, "RAW photograph (NEF)");
+        assert_eq!(of(&plain).kind, "TIFF image");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
