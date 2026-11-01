@@ -13,8 +13,9 @@ use std::sync::{Mutex, OnceLock};
 use image::RgbaImage;
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapDecoderInfo, IWICBitmapSource, IWICImagingFactory,
-    WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICComponentEnumerateDefault,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapDecoder, IWICBitmapDecoderInfo,
+    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, WICBitmapDitherTypeNone,
+    WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICComponentEnumerateDefault,
     WICDecodeMetadataCacheOnDemand, WICDecoder,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
@@ -130,6 +131,35 @@ fn from_wide(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+/// An icon or a cursor file: several sizes of one picture in one file, which `decode` opens at the biggest.
+fn is_icon(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ico") || e.eq_ignore_ascii_case("cur"))
+}
+
+/// The frame of the most pixels (an icon file holds 16 x 16 up to 256 x 256; the first is often the smallest).
+fn biggest_frame(decoder: &IWICBitmapDecoder) -> Result<IWICBitmapFrameDecode, String> {
+    // SAFETY: calls of the COM objects of WIC; the out parameters are plain integers.
+    unsafe {
+        let count = decoder.GetFrameCount().map_err(|e| e.to_string())?.clamp(1, 64);
+        let mut best: Option<(u64, IWICBitmapFrameDecode)> = None;
+        for index in 0..count {
+            let Ok(frame) = decoder.GetFrame(index) else { continue };
+            let (mut width, mut height) = (0u32, 0u32);
+            if frame.GetSize(&mut width, &mut height).is_err() {
+                continue;
+            }
+            let area = u64::from(width) * u64::from(height);
+            if best.as_ref().is_none_or(|(most, _)| area > *most) {
+                best = Some((area, frame));
+            }
+        }
+        best.map(|(_, frame)| frame)
+            .ok_or_else(|| "no frame to read".to_string())
+    }
+}
+
 /// Opens `path` with the decoder of this machine that fits it and gives its first frame as RGBA. With `fit` (a box in pixels) a
 /// frame bigger than the box is shrunk by WIC before it is turned to 8 bits, which is much cheaper for an HDR or a big one
 /// (the picture is only ever shown that size); without it, at its own size.
@@ -148,7 +178,11 @@ pub fn decode(path: &Path, fit: Option<(usize, usize)>) -> Result<RgbaImage, Str
                 WICDecodeMetadataCacheOnDemand,
             )
             .map_err(|e| format!("no codec of this Windows opens it: {e}"))?;
-        let frame = decoder.GetFrame(0).map_err(|e| e.to_string())?;
+        let frame = if is_icon(path) {
+            biggest_frame(&decoder)?
+        } else {
+            decoder.GetFrame(0).map_err(|e| e.to_string())?
+        };
         let (mut width, mut height) = (0u32, 0u32);
         frame.GetSize(&mut width, &mut height).map_err(|e| e.to_string())?;
         if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
@@ -224,6 +258,38 @@ mod tests {
         for codec in read_codecs().expect("WIC is on every Windows") {
             println!("{:<44} {}", codec.name, codec.extensions.join(" "));
         }
+    }
+
+    #[test]
+    fn an_icon_file_is_opened_at_its_biggest_size_not_its_first() {
+        // an ICO of two PNG frames, the small one first: 16 x 16 red and 48 x 48 blue
+        let png = |side: u32, colour: [u8; 4]| {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            RgbaImage::from_pixel(side, side, image::Rgba(colour))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .expect("a PNG");
+            bytes.into_inner()
+        };
+        let frames = [(16u8, png(16, [255, 0, 0, 255])), (48u8, png(48, [0, 0, 255, 255]))];
+        let mut ico = vec![0, 0, 1, 0, frames.len() as u8, 0];
+        let mut offset = 6 + 16 * frames.len() as u32;
+        for (side, data) in &frames {
+            ico.extend([*side, *side, 0, 0, 1, 0, 32, 0]);
+            ico.extend((data.len() as u32).to_le_bytes());
+            ico.extend(offset.to_le_bytes());
+            offset += data.len() as u32;
+        }
+        for (_, data) in &frames {
+            ico.extend(data);
+        }
+        let dir = std::env::temp_dir().join(format!("peekel-wic-ico-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let path = dir.join("two.ico");
+        std::fs::write(&path, ico).expect("the icon is written");
+        let opened = decode(&path, None).expect("Windows opens an icon");
+        assert_eq!((opened.width(), opened.height()), (48, 48), "the biggest frame");
+        assert_eq!(opened.get_pixel(24, 24).0, [0, 0, 255, 255], "and it is the blue one");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Not a check: opens the files named in `PEEKEL_WIC_FILES` (`;` between them) as the plugin does, box 1000 x 700, and writes

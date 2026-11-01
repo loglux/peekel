@@ -403,17 +403,47 @@ pub fn show_text() {
     }
 }
 
-/// Ctrl+Alt+I: the virtual key `I` with a Ctrl (left or right) and an Alt (left or right) held, and no Shift.
-fn is_info_key(virtual_key: u16, control_keys: u32) -> bool {
+/// Ctrl+Alt+`letter`: that virtual key with a Ctrl (left or right) and an Alt (left or right) held, and no Shift.
+fn is_chord(virtual_key: u16, control_keys: u32, letter: u8) -> bool {
     const RIGHT_ALT: u32 = 0x1;
     const LEFT_ALT: u32 = 0x2;
     const RIGHT_CTRL: u32 = 0x4;
     const LEFT_CTRL: u32 = 0x8;
     const SHIFT: u32 = 0x10;
-    virtual_key == u16::from(b'I')
+    virtual_key == u16::from(letter)
         && control_keys & (RIGHT_ALT | LEFT_ALT) != 0
         && control_keys & (RIGHT_CTRL | LEFT_CTRL) != 0
         && control_keys & SHIFT == 0
+}
+
+/// Ctrl+Alt+I: the card of the file in place of its picture.
+fn is_info_key(virtual_key: u16, control_keys: u32) -> bool {
+    is_chord(virtual_key, control_keys, b'I')
+}
+
+/// Ctrl+Alt+S: the Microsoft Store, for the codec that the file shown lacks.
+fn is_store_key(virtual_key: u16, control_keys: u32) -> bool {
+    is_chord(virtual_key, control_keys, b'S')
+}
+
+/// Every input record, before Far has it: Ctrl+Alt+S, while the quick view shows a file whose Store codec Windows lacks (its card
+/// says so), opens the Store at the search for that extension. True when the record is that key and there is such a file (the
+/// press and the release both); with none the key is Far's.
+pub fn takes_store_key(record: &api::InputRecord) -> bool {
+    if record.event_type != api::KEY_EVENT || !is_store_key(record.virtual_key, record.control_keys) {
+        return false;
+    }
+    let Ok(state) = STATE.lock() else {
+        return false;
+    };
+    let Some(url) = state.target.as_ref().and_then(|t| crate::formats::store_url(&t.path)) else {
+        return false;
+    };
+    if record.key_down != 0 {
+        log::line(&format!("Ctrl+Alt+S: {url}"));
+        crate::formats::open_url(&url);
+    }
+    true
 }
 
 /// Every input record, before Far has it: Ctrl+Alt+I, while a picture is shown in the quick view, turns the card of the
@@ -1180,6 +1210,21 @@ mod tests {
         assert!(!is_info_key(u16::from(b'I'), 0), "so is a plain i");
         assert!(!is_info_key(u16::from(b'I'), ctrl | alt | shift));
         assert!(!is_info_key(u16::from(b'O'), ctrl | alt));
+    }
+
+    #[test]
+    fn ctrl_alt_s_is_the_key_for_the_store_and_nothing_less() {
+        let (ctrl, alt, shift) = (0x8, 0x2, 0x10);
+        assert!(is_store_key(u16::from(b'S'), ctrl | alt));
+        assert!(is_store_key(u16::from(b'S'), 0x4 | 0x1), "the right Ctrl and Alt too");
+        assert!(!is_store_key(u16::from(b'S'), ctrl), "Ctrl+S alone is Far's");
+        assert!(!is_store_key(u16::from(b'S'), alt));
+        assert!(!is_store_key(u16::from(b'S'), ctrl | alt | shift));
+        assert!(
+            !is_store_key(u16::from(b'I'), ctrl | alt),
+            "the card's key is not the Store's"
+        );
+        assert!(!is_info_key(u16::from(b'S'), ctrl | alt));
     }
 
     #[test]

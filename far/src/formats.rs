@@ -35,21 +35,21 @@ fn words(text: &str) -> Vec<String> {
 }
 
 /// The Store extensions that give Windows a codec for a format `core` does not read, by file extension (no dot, lower case):
-/// the names as the Microsoft Store has them (docs/internal/wic.md). Only these are named; no other file gets a hint.
+/// the names as Microsoft's pages have them (docs/internal/wic.md: the JPEG XL Image Extension and the HEIF Image Extension are
+/// Store products; the HEIF page says the HEVC and AV1 codecs "might not be available on all PCs" and come from the Store).
+/// Only these are named; no other file gets a hint.
 fn store_extensions(extension: &str) -> Option<&'static str> {
     match extension {
         "jxl" => Some("the JPEG XL Image Extension"),
-        "heic" | "heif" | "hif" | "avci" | "heics" | "heifs" => {
-            Some("the HEIF Image Extension and HEVC Video Extensions")
-        }
-        "avif" | "avifs" => Some("the HEIF Image Extension and the AV1 Video Extension"),
+        "heic" | "heif" | "hif" | "avci" | "heics" | "heifs" => Some("the HEIF Image Extension and an HEVC codec"),
+        "avif" | "avifs" => Some("the HEIF Image Extension and an AV1 codec"),
         _ => None,
     }
 }
 
-/// What the card of a file that no codec opened may say: which Store extension gives Windows the codec, when the extension of
-/// the file is one of a Store codec and Windows has none of it (not in the list, or listed and not started). `why` is the
-/// reason the file was not read as a picture. None for any other file.
+/// What the card of a file that no codec opened may say: what was seen (Windows has no codec for it, or lists one that did not
+/// start) and which Store extension may give it. A possibility, not a cause: the extension of the file is one of a Store codec,
+/// that is all that is known. `why` is the reason the file was not read as a picture. None for any other file.
 pub fn codec_hint(path: &std::path::Path, why: &str) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     hint_for(&extension, crate::wic::supports(&extension), why)
@@ -58,10 +58,78 @@ pub fn codec_hint(path: &std::path::Path, why: &str) -> Option<String> {
 /// `codec_hint` for an extension (lower case) and what is known of this Windows: whether a decoder of it is in the list.
 fn hint_for(extension: &str, listed: bool, why: &str) -> Option<String> {
     let names = store_extensions(extension)?;
-    if listed && !crate::wic::is_component_failure(why) {
-        return None; // the codec is there: the file is damaged, or the card was asked for
+    if !listed {
+        return Some(format!(
+            "Windows has no codec for it; {names} (Microsoft Store) may add one. Ctrl+Alt+S opens the Store"
+        ));
     }
-    Some(format!("needs {names} (Microsoft Store)"))
+    if crate::wic::is_component_failure(why) {
+        return Some(format!(
+            "Windows lists a codec but it did not start (0x88982F8B); {names} (Microsoft Store) may fix it. Ctrl+Alt+S opens the Store"
+        ));
+    }
+    None // the codec is there: the file is damaged, or the card was asked for
+}
+
+/// The Store product that gives Windows the codec for files of this extension, by its Store product ID. Each ID was checked on its
+/// own page (apps.microsoft.com/detail/<id>: "JPEG XL Image Extension", "HEIF Image Extension"), and the Photos app of Windows
+/// carries the same two in its own table of Store links (docs/internal/wic.md). The first extension named in `store_extensions`
+/// is the one the key opens (a HEIC also wants an HEVC codec, an AVIF an AV1 one: those have pages of their own).
+fn store_product(extension: &str) -> Option<&'static str> {
+    match extension {
+        "jxl" => Some("9MZPRTH5C0TB"),
+        "heic" | "heif" | "hif" | "avci" | "heics" | "heifs" | "avif" | "avifs" => Some("9PMMSR1CGPWG"),
+        _ => None,
+    }
+}
+
+/// The address that opens the page of that Store product in the Microsoft Store (`ms-windows-store://pdp/?ProductId=`, documented at
+/// learn.microsoft.com/windows/apps/develop/launch/launch-store-app), for a file whose extension is one of a Store codec that
+/// Windows lacks or could not start (the cases of `codec_hint`); None for any other file.
+pub fn store_url(path: &std::path::Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    url_for(
+        &extension,
+        crate::wic::supports(&extension) && !crate::wic::failed(&extension),
+    )
+}
+
+/// `store_url` for an extension (lower case) and whether Windows has a codec of it that works.
+fn url_for(extension: &str, works: bool) -> Option<String> {
+    if works {
+        return None;
+    }
+    Some(format!(
+        "ms-windows-store://pdp/?ProductId={}",
+        store_product(extension)?
+    ))
+}
+
+/// Opens `url` as the shell does for the user (a `ms-windows-store:` address starts the Store). Nothing is waited for or installed
+/// here: the Store shows the page, and the user decides.
+pub fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
+    let address = HSTRING::from(url);
+    // SAFETY: both strings are zero-ended UTF-16 that live through the call; no window is the owner.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &address,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute answers a value above 32 when it worked
+    if (result.0 as isize) <= 32 {
+        crate::log::line(&format!(
+            "the Store did not open: ShellExecute answered {}",
+            result.0 as isize
+        ));
+    }
 }
 
 /// The box: a title line, then lines (Far's message box takes them as one string, split at the new lines).
@@ -97,13 +165,11 @@ pub fn text(codecs: Option<&[Codec]>, version: &str) -> String {
                 }
                 out.extend(wrap(&format!("  {}:", codec.name), "    ", &list));
                 if left.iter().any(|e| crate::wic::failed(e)) {
-                    out.push(
-                        "    listed, but it did not start on a file: the extension is not really installed".to_string(),
-                    );
+                    out.push("    listed, but Windows could not start it on a file (0x88982F8B)".to_string());
                 }
             }
             if shown == 0 {
-                out.push("  nothing more (no decoders of HEIC, AVIF, JPEG XL, ... are installed)".to_string());
+                out.push("  nothing more (Windows lists no decoders of HEIC, AVIF, JPEG XL, ...)".to_string());
             }
         }
     }
@@ -138,11 +204,44 @@ mod tests {
         );
         // in the list and the file is just damaged: no hint; in the list but not started: the hint
         assert_eq!(hint_for("heic", true, "the image is unrecognized (0x88982F60)"), None);
-        assert!(hint_for("jxl", true, "The component initialization has failed. (0x88982F8B)").is_some());
+        let failed = hint_for("jxl", true, "The component initialization has failed. (0x88982F8B)");
+        assert!(
+            failed
+                .as_deref()
+                .is_some_and(|h| h.contains("did not start") && h.contains("may fix")),
+            "{failed:?}"
+        );
+        // a cause is never stated as a fact
+        assert!(hint_for("jxl", false, "no codec").is_some_and(|h| h.contains("may add") && !h.contains("needs")));
+        // the hint says which key opens the Store, only where that key will work
+        assert!(hint_for("jxl", false, "no codec").is_some_and(|h| h.contains("Ctrl+Alt+S")));
         // no other file gets one
         assert_eq!(hint_for("png", false, "no codec"), None);
         assert_eq!(hint_for("docx", false, "no codec"), None);
         assert_eq!(codec_hint(std::path::Path::new("noextension"), "no codec"), None);
+    }
+
+    #[test]
+    fn the_store_address_is_the_page_of_the_product_and_only_for_a_store_codec_that_is_missing() {
+        assert_eq!(
+            url_for("jxl", false).as_deref(),
+            Some("ms-windows-store://pdp/?ProductId=9MZPRTH5C0TB"),
+            "the JPEG XL Image Extension"
+        );
+        assert_eq!(
+            url_for("heic", false).as_deref(),
+            Some("ms-windows-store://pdp/?ProductId=9PMMSR1CGPWG"),
+            "the HEIF Image Extension"
+        );
+        assert_eq!(url_for("avif", false), url_for("heic", false));
+        assert_eq!(url_for("jxl", true), None, "a codec that works needs no Store");
+        assert_eq!(url_for("png", false), None, "not a Store codec");
+        assert_eq!(url_for("docx", false), None);
+        assert_eq!(
+            store_url(std::path::Path::new("noextension")),
+            None,
+            "nothing to look up without an extension"
+        );
     }
 
     #[test]
