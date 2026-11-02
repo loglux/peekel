@@ -205,9 +205,8 @@ pub fn properties(data: &[u8]) -> Vec<(String, String)> {
         }
         // the layers of the page that this reader does not draw: the page is then white or without its text where they are
         let missing: Vec<&str> = [
-            (*b"BGjp", "the JPEG background"),
-            (*b"FGjp", "the JPEG foreground colours"),
-            (*b"Smmr", "the Fax G4 mask"),
+            (*b"BG2k", "the JPEG 2000 background"),
+            (*b"FG2k", "the JPEG 2000 foreground colours"),
         ]
         .iter()
         .filter(|(id, _)| first.chunks(*id).next().is_some())

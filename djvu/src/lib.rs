@@ -15,6 +15,8 @@ pub mod iff;
 pub mod info;
 pub mod iw44;
 pub mod jb2;
+pub mod jpeg;
+pub mod mmr;
 pub mod page;
 pub mod zp;
 mod zp_table;
@@ -50,6 +52,10 @@ pub enum Error {
     BadJb2(&'static str),
     /// IW44 data that cannot be decoded: a first chunk that is missing or too short, chunks out of order, or past a limit.
     BadIw44(&'static str),
+    /// An `Smmr` mask that cannot be decoded: not its header, a stripe that is cut short, or G4 data that is not G4.
+    BadMmr(&'static str),
+    /// A `BGjp` or `FGjp` JPEG that cannot be decoded.
+    BadJpeg(&'static str),
     /// A page whose parts do not fit together: a mask that is not the size of the page.
     BadPage(&'static str),
 }
@@ -73,6 +79,8 @@ impl fmt::Display for Error {
             Self::BadBzz(why) => write!(f, "BZZ data that cannot be decoded: {why}"),
             Self::BadJb2(why) => write!(f, "JB2 data that cannot be decoded: {why}"),
             Self::BadIw44(why) => write!(f, "IW44 data that cannot be decoded: {why}"),
+            Self::BadMmr(why) => write!(f, "an MMR mask that cannot be decoded: {why}"),
+            Self::BadJpeg(why) => write!(f, "a JPEG layer that cannot be decoded: {why}"),
             Self::BadPage(why) => write!(f, "a page that does not fit together: {why}"),
         }
     }

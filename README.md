@@ -66,7 +66,7 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | RAW photographs (NEF, CR2, ARW, DNG, ORF, PEF and others) | the camera's own JPEG preview (the full size in most files), in a few tenths of a second |
 | HEIC, AVIF, JPEG XL, JPEG XR, DDS and whatever else **your Windows** has a codec for | the picture, only where the codec is installed (Windows' own codecs; the menu Commands, Plugin commands, "Peekel: formats" lists what yours has) |
 | PDF (text pages and scans; not password-protected) | the first page |
-| DjVu (scanned books) | the first page; the card gives the number of pages and the size of the page (read by a reader of our own, written from the format's open specification; not read yet: the JPEG layers and the Fax G4 mask of a page (there were no sample files to check them against), the text layer, and documents whose pages are separate files) |
+| DjVu (scanned books) | the first page; the card gives the number of pages and the size of the page (read by a reader of our own, written from the format's open specification; not read yet: the text layer and documents whose pages are separate files) |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
 | Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |

@@ -5,11 +5,13 @@
 //! the longest side is 2048 pixels when the file's own size is smaller, the file's own size up to 4096, and 4096 beyond
 //! that (at most 16 megapixels). It is not drawn again at a higher zoom.
 //!
-//! Not read: pictures inside the SVG (`<image>`; resvg's `raster-images` would bring a second set of decoders), and
-//! nothing outside the file is ever opened (the resolvers of `<image>` return nothing). Text is drawn with the fonts installed on the machine; where the font is
-//! missing, resvg picks another or draws nothing.
+//! A picture inside the SVG (`<image>`) is drawn when it is stored in the file itself (a `data:` URL) and is a PNG, a JPEG, a GIF
+//! or a WebP, within the limits below. Not read: another SVG inside an SVG (it would be parsed with none of our limits), and
+//! nothing outside the file is ever opened (a path or an address in `<image>` gives nothing). Text is drawn with the fonts
+//! installed on the machine; where the font is missing, resvg picks another or draws nothing.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use image::RgbaImage;
@@ -31,6 +33,10 @@ const MAX_DEPTH: usize = 256;
 const MAX_ENTITIES: usize = 64;
 const MAX_ENTITY_VALUE: usize = 4096;
 const MAX_REFERENCES: usize = 20_000;
+/// A picture inside a drawing may have this many pixels (a photograph of 12 megapixels is fine), and all the pictures of one
+/// drawing together this many: resvg decodes each one to 4 bytes a pixel when it draws.
+const MAX_IMAGE_PIXELS: u64 = 16_000_000;
+const MAX_IMAGES_TOTAL: u64 = 48_000_000;
 /// A drawing smaller than this is made this large (on its longest side) ...
 const SHARP_SIDE: f32 = 2048.0;
 /// ... and a larger one is made no larger than this.
@@ -297,6 +303,31 @@ pub fn render_in_font(
     draw_with(markup.as_bytes(), false, Arc::new(db), family)
 }
 
+/// The resolver of the pictures that a drawing stores in itself (`data:` URLs): a PNG, a JPEG, a GIF or a WebP, told by its own
+/// first bytes and not by the name the drawing gives it, not above the pixel limits (read from the header, before anything is
+/// decoded). Anything else, an SVG too, gives nothing.
+fn embedded_pictures() -> usvg::ImageHrefDataResolverFn<'static> {
+    let drawn = AtomicU64::new(0);
+    Box::new(move |_mime, data, _options| {
+        let reader = image::ImageReader::new(std::io::Cursor::new(&data[..]))
+            .with_guessed_format()
+            .ok()?;
+        let format = reader.format()?;
+        let (width, height) = reader.into_dimensions().ok()?;
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > MAX_IMAGE_PIXELS || drawn.fetch_add(pixels, Ordering::Relaxed) + pixels > MAX_IMAGES_TOTAL {
+            return None;
+        }
+        match format {
+            image::ImageFormat::Png => Some(usvg::ImageKind::PNG(data)),
+            image::ImageFormat::Jpeg => Some(usvg::ImageKind::JPEG(data)),
+            image::ImageFormat::Gif => Some(usvg::ImageKind::GIF(data)),
+            image::ImageFormat::WebP => Some(usvg::ImageKind::WEBP(data)),
+            _ => None,
+        }
+    })
+}
+
 fn draw_with(
     data: &[u8],
     enlarge: bool,
@@ -308,9 +339,9 @@ fn draw_with(
         fontdb,
         font_family,
         // a drawing is no reason to open another file (a path, a share that asks for a login) or to parse another drawing
-        // that has no limits: no `<image>` is resolved
+        // that has no limits: only the pictures stored in the file are resolved
         image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
+            resolve_data: embedded_pictures(),
             resolve_string: Box::new(|_, _| None),
         },
         ..usvg::Options::default()
@@ -392,6 +423,80 @@ mod tests {
         let image = draw(&outer).expect("the outer drawing is fine");
         let _ = std::fs::remove_file(&inner);
         assert!(image.pixels().all(|p| p[3] == 0), "nothing of the other file is drawn");
+    }
+
+    /// `bytes` as base64 (the drawing stores its pictures so).
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut text = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    text.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+                } else {
+                    text.push('=');
+                }
+            }
+        }
+        text
+    }
+
+    /// A PNG of one colour, `width` x `height`.
+    fn png(width: u32, height: u32, colour: [u8; 4]) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(width, height, image::Rgba(colour))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("encodes");
+        out.into_inner()
+    }
+
+    /// A drawing of 10 x 10 with one `<image>` that has this `mime` and these bytes.
+    fn with_picture(mime: &str, bytes: &[u8]) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><image width="10" height="10" xlink:href="data:{mime};base64,{}"/></svg>"#,
+            base64(bytes)
+        )
+    }
+
+    #[test]
+    fn a_picture_stored_in_the_drawing_is_drawn_whatever_name_the_drawing_gives_it() {
+        let red = png(4, 4, [255, 0, 0, 255]);
+        for mime in ["image/png", "image/jpeg", "text/plain"] {
+            let image = render_exact(&with_picture(mime, &red)).expect("drawn");
+            let [r, g, b, a] = image.get_pixel(image.width() / 2, image.height() / 2).0;
+            assert!(r > 240 && g < 15 && b < 15 && a == 255, "{mime}: {r} {g} {b} {a}");
+        }
+    }
+
+    #[test]
+    fn a_drawing_inside_a_drawing_and_a_picture_over_the_limit_are_not_drawn() {
+        let inner = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        let nested = draw(&with_picture("image/svg+xml", inner)).expect("the outer drawing is fine");
+        assert!(nested.pixels().all(|p| p[3] == 0), "another drawing is not parsed");
+        // a PNG whose header says 5000 x 5000, 25 megapixels, over the limit of one picture though the file is small (the
+        // header of a one pixel PNG with the size and its checksum changed: the limit is judged on the header alone)
+        let mut big = png(1, 1, [0, 0, 255, 255]);
+        big[16..20].copy_from_slice(&5000u32.to_be_bytes());
+        big[20..24].copy_from_slice(&5000u32.to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(&big[12..29]);
+        big[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+        assert_eq!(
+            image::ImageReader::new(std::io::Cursor::new(&big))
+                .with_guessed_format()
+                .expect("format")
+                .into_dimensions()
+                .expect("size"),
+            (5000, 5000)
+        );
+        let refused = draw(&with_picture("image/png", &big)).expect("the outer drawing is fine");
+        assert!(
+            refused.pixels().all(|p| p[3] == 0),
+            "a picture over the limit is not decoded"
+        );
     }
 
     #[test]

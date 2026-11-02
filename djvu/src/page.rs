@@ -48,15 +48,30 @@ pub fn shared_dictionary(
     }
 }
 
-/// The colour picture made of the chunks with this id (`BG44` or `FG44`), when the page has any.
-fn layer(page: &Page<'_, '_>, id: [u8; 4]) -> Result<Option<Pixmap>, Error> {
+/// The colour picture made of the chunks with this id (`BG44` or `FG44`), or else of the JPEG chunk `jpeg` (`BGjp` or `FGjp`), when
+/// the page has any. DjVuLibre takes the IW44 picture first (a page with both does not occur in files it writes).
+fn layer(page: &Page<'_, '_>, id: [u8; 4], jpeg: [u8; 4]) -> Result<Option<Pixmap>, Error> {
     let mut picture = Iw44::new();
     let mut any = false;
     for chunk in page.chunks(id) {
         picture.add_chunk(chunk.data)?;
         any = true;
     }
-    if any { picture.pixmap().map(Some) } else { Ok(None) }
+    if any {
+        return picture.pixmap().map(Some);
+    }
+    page.chunks(jpeg)
+        .next()
+        .map(|chunk| crate::jpeg::decode(chunk.data))
+        .transpose()
+}
+
+/// The mask of a page that has no `Sjbz` (JB2) chunk, from its `Smmr` (Fax G4) chunk; None when the page has neither.
+fn mask_of_mmr(page: &Page<'_, '_>) -> Result<Option<jb2::Bitmap>, Error> {
+    page.chunks(*b"Smmr")
+        .next()
+        .map(|chunk| crate::mmr::decode(chunk.data))
+        .transpose()
 }
 
 /// The most pixels a page may have: a scan at 600 dpi of a large page is about 70 million; a page that says more is refused before
@@ -190,8 +205,9 @@ pub fn render_with(page: &Page<'_, '_>, dictionary: Option<&jb2::Dictionary>) ->
     }
     let colours = page.chunks(*b"FGbz").next().and_then(|chunk| palette(chunk.data));
     // the pictures of the background and the foreground, which do not depend on the mask, are made on a thread while the mask is
-    let layers =
-        || -> Result<(Option<Pixmap>, Option<Pixmap>), Error> { Ok((layer(page, *b"BG44")?, layer(page, *b"FG44")?)) };
+    let layers = || -> Result<(Option<Pixmap>, Option<Pixmap>), Error> {
+        Ok((layer(page, *b"BG44", *b"BGjp")?, layer(page, *b"FG44", *b"FGjp")?))
+    };
     // the mask, and when the shapes have colours of their own, the shapes too
     let masks = || -> Result<(Option<jb2::Bitmap>, Option<jb2::PageShapes>), Error> {
         Ok(match (page.chunks(*b"Sjbz").next(), colours.is_some()) {
@@ -200,7 +216,7 @@ pub fn render_with(page: &Page<'_, '_>, dictionary: Option<&jb2::Dictionary>) ->
                 (Some(std::mem::take(&mut drawn.mask)), Some(drawn))
             }
             (Some(chunk), false) => (Some(jb2::decode_image(chunk.data, dictionary)?), None),
-            (None, _) => (None, None),
+            (None, _) => (mask_of_mmr(page)?, None),
         })
     };
     let (layers, masks) = alongside(layers, masks);
@@ -306,6 +322,10 @@ fn reduced(
     out_h: usize,
 ) -> Result<Option<Pixmap>, Error> {
     let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    // an Fax G4 mask is not read as shapes: the whole page is made and the caller shrinks it
+    if page.chunks(*b"Smmr").next().is_some() {
+        return Ok(None);
+    }
     if let Some((bg_w, bg_h)) = layer_size(page, *b"BG44")
         && (out_w > bg_w || out_h > bg_h)
     {
@@ -313,12 +333,12 @@ fn reduced(
     }
     // the background (its own picture shrunk to the size) and the foreground picture are made on a thread while the shapes are
     let layers = || -> Result<(Option<Vec<u8>>, Option<Pixmap>), Error> {
-        let rgb = match layer(page, *b"BG44")? {
+        let rgb = match layer(page, *b"BG44", *b"BGjp")? {
             Some(bg) if out_w <= bg.width && out_h <= bg.height => Some(shrunk(&bg, out_w, out_h)),
             Some(_) => None,
             None => Some(vec![255u8; out_w * out_h * 3]),
         };
-        Ok((rgb, layer(page, *b"FG44")?))
+        Ok((rgb, layer(page, *b"FG44", *b"FGjp")?))
     };
     let shapes = || -> Result<Option<jb2::PageShapes>, Error> {
         page.chunks(*b"Sjbz")
@@ -595,7 +615,7 @@ pub fn background(page: &Page<'_, '_>) -> Result<Pixmap, Error> {
         return Err(Error::BadPage("the page has more pixels than the limit"));
     }
     let mut rgb = vec![255u8; width * height * 3];
-    if let Some(bg) = layer(page, *b"BG44")? {
+    if let Some(bg) = layer(page, *b"BG44", *b"BGjp")? {
         fill_from(&mut rgb, width, height, &bg);
     }
     Ok(Pixmap { width, height, rgb })

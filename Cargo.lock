@@ -525,7 +525,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "peekel-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "flate2",
  "hayro",
@@ -539,11 +539,16 @@ dependencies = [
 
 [[package]]
 name = "peekel-djvu"
-version = "0.4.1"
+version = "0.4.2"
+dependencies = [
+ "fax",
+ "zune-core",
+ "zune-jpeg",
+]
 
 [[package]]
 name = "peekel-far"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "image",
  "peekel-core",
@@ -702,12 +707,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1572844b6727a1bf842190e9947641a68ac44bed83f50afb4bd1407a2564bee8"
 dependencies = [
  "bytemuck",
+ "gif",
+ "image-webp",
  "log",
  "pico-args",
  "rgb",
  "svgtypes",
  "tiny-skia",
  "usvg",
+ "zune-jpeg",
 ]
 
 [[package]]

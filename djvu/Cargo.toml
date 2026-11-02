@@ -1,4 +1,4 @@
-# DjVu, read from the public specification (DjVu v3, sndjvu.org/spec.html): safe code only, no dependencies yet.
+# DjVu, read from the public specification (DjVu v3, sndjvu.org/spec.html): safe code only; the only dependencies are the G4 and JPEG decoders of the two layers that the spec does not describe.
 # docs/internal/djvu.md has why this is written here and not taken from a library.
 [package]
 name = "peekel-djvu"
@@ -12,3 +12,9 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# the G4 (MMR) decoder of the `Smmr` mask and the JPEG decoder of `BGjp`/`FGjp`: both are in Cargo.lock already (through `image`)
+fax = "0.2.7"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
