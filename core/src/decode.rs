@@ -68,10 +68,18 @@ struct Special {
     draw: fn(&Path) -> Result<RgbaImage, DecodeError>,
 }
 
-const SPECIAL: [Special; 7] = [
+const SPECIAL: [Special; 9] = [
     Special {
         is: crate::raw::is_raw,
         draw: crate::raw::render,
+    },
+    Special {
+        is: crate::dds::is_dds,
+        draw: crate::dds::render,
+    },
+    Special {
+        is: crate::jxl::is_jxl,
+        draw: crate::jxl::render,
     },
     Special {
         is: crate::svg::is_svg,
@@ -120,6 +128,33 @@ pub fn decode_full(path: &Path) -> Result<RgbaImage, DecodeError> {
         return (special.draw)(path);
     }
     decode_reader(ImageReader::open(path).map_err(unreadable)?, MAX_PIXELS, 1)
+}
+
+/// The contents of a book (its bookmarks), for a list to jump from: `Some` for a DjVu book that has them; `None` for a book with none and
+/// for the kinds of file whose contents are not read yet (a PDF).
+pub fn contents(path: &Path) -> Result<Option<Vec<crate::djvu::ContentsItem>>, DecodeError> {
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::contents(path);
+    }
+    Ok(None)
+}
+
+/// The text of each page of a book, for a search: `Some` for a DjVu file that has a text layer (an empty string for a page without
+/// text); `None` for a book with no text layer and for the kinds of file whose text is not read yet (a PDF).
+pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::page_texts(path);
+    }
+    Ok(None)
+}
+
+/// Marks on `image` (page `page` of the file as `decode_page` gave it) the words that `needle` (made by `djvu::normalise`) is in: for a
+/// DjVu book with the zones of its text layer; nothing is marked in any other file. How many words were marked.
+pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage) -> Result<usize, DecodeError> {
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::mark_words(path, page, needle, image);
+    }
+    Ok(0)
 }
 
 /// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF or a DjVu file has many, anything else one

@@ -105,6 +105,63 @@ pub fn encode_on(
 /// A picture this big (in pixels) is worth the threads.
 const PARALLEL_FROM: usize = 400_000;
 
+/// A strip of this many pixels is tried first by [`encode_limited`]: big enough for the threads, small enough that a page of text
+/// is a few strips and not one that has to be cut again.
+const FIRST_STRIP_PIXELS: usize = 1_000_000;
+
+/// Rows `0..height` as several Sixel streams, none longer than `limit` bytes, each with the row it starts at: a terminal may drop a
+/// string that is too long (xterm took one of 0.57 MB and dropped ones of 0.67 MB and more, 3 November 2026; Windows Terminal and
+/// foot took several MB). A strip starts at a multiple of `unit` rows (the cell's height, so that it starts at a cell), and a strip
+/// of one `unit` is kept whatever its length: a row of cells cannot be cut. A strip too long is cut in two and the halves tried again.
+pub fn encode_limited(
+    index: &[u8],
+    palette: &[u32],
+    width: usize,
+    height: usize,
+    bg: u32,
+    unit: usize,
+    limit: usize,
+) -> Vec<(usize, String)> {
+    let unit = unit.max(1);
+    let first = (FIRST_STRIP_PIXELS / width.max(1) / unit).max(1) * unit;
+    let mut strips = Vec::new();
+    let mut top = 0;
+    while top < height {
+        let rows = first.min(height - top);
+        cut(index, palette, width, (top, rows), bg, (unit, limit), &mut strips);
+        top += rows;
+    }
+    strips
+}
+
+/// The rows `(top, rows)` as one strip when it is short enough, else as the two halves (each a multiple of `unit.0` rows but the last).
+fn cut(
+    index: &[u8],
+    palette: &[u32],
+    width: usize,
+    (top, rows): (usize, usize),
+    bg: u32,
+    (unit, limit): (usize, usize),
+    strips: &mut Vec<(usize, String)>,
+) {
+    let stream = encode_indexed(index, palette, width, top, rows, bg);
+    if stream.len() <= limit || rows <= unit {
+        strips.push((top, stream));
+        return;
+    }
+    let half = (rows / unit / 2).max(1) * unit;
+    cut(index, palette, width, (top, half), bg, (unit, limit), strips);
+    cut(
+        index,
+        palette,
+        width,
+        (top + half, rows - half),
+        bg,
+        (unit, limit),
+        strips,
+    );
+}
+
 /// Bands `first..end` (six rows each) of the `height` rows starting at `top`, as passes; a `-` follows every band
 /// but the picture's last.
 fn encode_bands(sb: &mut String, index: &[u8], width: usize, top: usize, height: usize, first: usize, end: usize) {
@@ -179,6 +236,7 @@ fn percent(v: u32) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)] // a test that cannot read its own stream should stop at once
 mod tests {
     use super::*;
 
@@ -252,6 +310,63 @@ mod tests {
                 "{threads} threads"
             );
         }
+    }
+
+    /// A picture of noise: every pixel one of many colours, so its Sixel is long.
+    fn noisy(width: usize, height: usize) -> (Vec<u8>, Vec<u32>) {
+        let index: Vec<u8> = (0..width * height)
+            .map(|i| ((i * 7 + i / width * 13 + (i % 5) * 31) % 200) as u8)
+            .collect();
+        let palette: Vec<u32> = (0..200).map(|c| c * 0x01_0203).collect();
+        (index, palette)
+    }
+
+    #[test]
+    fn strips_are_short_start_at_cells_and_cover_every_row() {
+        let (width, height, unit, limit) = (300, 410, 20, 12_000);
+        let (index, palette) = noisy(width, height);
+        let strips = encode_limited(&index, &palette, width, height, 0, unit, limit);
+        assert!(strips.len() > 1, "the picture is long enough to be cut");
+        let mut next = 0;
+        for (top, stream) in &strips {
+            assert_eq!(*top, next, "no row is left out or drawn twice");
+            assert_eq!(top % unit, 0, "a strip starts at a cell");
+            let rows = stream
+                .split("\"1;1;")
+                .nth(1)
+                .and_then(|s| s.split(';').nth(1))
+                .and_then(|s| {
+                    s.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .expect("the raster attributes tell the height");
+            assert!(
+                stream.len() <= limit || rows <= unit,
+                "{} bytes for {rows} rows",
+                stream.len()
+            );
+            next += rows;
+        }
+        assert_eq!(next, height);
+    }
+
+    #[test]
+    fn a_short_picture_is_one_strip_and_the_same_bytes_as_one_stream() {
+        let (width, height) = (40, 50);
+        let (index, palette) = noisy(width, height);
+        let strips = encode_limited(&index, &palette, width, height, 0, 20, 1_000_000);
+        assert_eq!(strips, vec![(0, encode_indexed(&index, &palette, width, 0, height, 0))]);
+    }
+
+    #[test]
+    fn a_row_of_cells_is_kept_whole_however_long() {
+        let (width, height, unit) = (300, 60, 20);
+        let (index, palette) = noisy(width, height);
+        let strips = encode_limited(&index, &palette, width, height, 0, unit, 10);
+        assert_eq!(strips.iter().map(|(top, _)| *top).collect::<Vec<_>>(), [0, 20, 40]);
     }
 
     #[test]

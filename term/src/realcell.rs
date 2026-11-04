@@ -71,79 +71,24 @@ pub fn differs(nominal: (usize, usize), real: (usize, usize)) -> bool {
     (a / b - 1.0).abs() > 0.01
 }
 
+/// What Windows says about the window of Windows Terminal that this console belongs to, with the size of the text in cells. None
+/// when the console is not that of Windows Terminal or the window cannot be read.
+pub fn facts() -> Option<Facts> {
+    let ((width, height), dpi, bar) = crate::sys::terminal_window()?;
+    let size = crate::window_size().ok()?;
+    Some(Facts {
+        client: (width, height),
+        dpi,
+        bar,
+        columns: usize::from(size.cols),
+        rows: usize::from(size.rows),
+    })
+}
+
 /// Measures the window of the terminal that this console belongs to, and works the cell out. None when the console is not that of
 /// Windows Terminal, or the window cannot be read, or the cell cannot be told.
 pub fn measure() -> Option<(usize, usize)> {
-    let facts = facts()?;
-    solve(&facts)
-}
-
-#[cfg(windows)]
-fn facts() -> Option<Facts> {
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-    use windows::Win32::System::Console::{
-        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE,
-    };
-    use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, GA_ROOTOWNER, GetAncestor, GetClassNameW, GetClientRect,
-    };
-    use windows::core::BOOL;
-
-    /// The name of the class of a window.
-    fn class_of(window: HWND) -> String {
-        let mut name = [0u16; 128];
-        // SAFETY: a buffer of its own, and its length is what the call is told.
-        let n = unsafe { GetClassNameW(window, &mut name) };
-        String::from_utf16_lossy(&name[..usize::try_from(n).unwrap_or(0).min(name.len())])
-    }
-
-    // SAFETY: calls with no pointers of ours, except the rectangles and the structure below, which live through them.
-    unsafe {
-        let console = GetConsoleWindow();
-        if console.0.is_null() {
-            return None;
-        }
-        // the window that the terminal made for the console is owned by the terminal's own window
-        let window = GetAncestor(console, GA_ROOTOWNER);
-        if window.0.is_null() || class_of(window) != "CASCADIA_HOSTING_WINDOW_CLASS" {
-            return None;
-        }
-        let mut client = RECT::default();
-        GetClientRect(window, &mut client).ok()?;
-        let dpi = GetDpiForWindow(window);
-        // the title bar with the tabs is a child window of its own
-        extern "system" fn bar_height(child: HWND, found: LPARAM) -> BOOL {
-            if class_of(child) == "DRAG_BAR_WINDOW_CLASS" {
-                let mut rect = RECT::default();
-                // SAFETY: `found` is the address of an i32 of the caller, which is there while the enumeration runs.
-                unsafe {
-                    if GetClientRect(child, &mut rect).is_ok() {
-                        *(found.0 as *mut i32) = rect.bottom - rect.top;
-                    }
-                }
-            }
-            BOOL(1)
-        }
-        let mut bar = 0i32;
-        let _ = EnumChildWindows(Some(window), Some(bar_height), LPARAM(&mut bar as *mut i32 as isize));
-        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE).ok()?, &mut info).ok()?;
-        let columns = usize::try_from(info.srWindow.Right - info.srWindow.Left + 1).ok()?;
-        let rows = usize::try_from(info.srWindow.Bottom - info.srWindow.Top + 1).ok()?;
-        Some(Facts {
-            client: (client.right - client.left, client.bottom - client.top),
-            dpi,
-            bar,
-            columns,
-            rows,
-        })
-    }
-}
-
-#[cfg(not(windows))]
-fn facts() -> Option<Facts> {
-    None
+    solve(&facts()?)
 }
 
 #[cfg(test)]
@@ -200,5 +145,26 @@ mod tests {
         assert!(!differs((10, 20), (14, 28)));
         assert!(!differs((10, 20), (10, 20)));
         assert!(!differs((10, 20), (20, 40)));
+    }
+
+    #[test]
+    fn the_window_of_a_4k_screen_at_150_percent_gives_consolas_13_by_28() {
+        // what `peekel.exe --timing` printed (2 November 2026) was 2560 x 1392 with a bar of 32 for 291 columns and 72 rows: sizes
+        // that a program not aware of the screen's scale is given (at 96 dpi); the real ones are 1.5 times as many
+        let window = Facts {
+            client: (3840, 2088),
+            dpi: 144,
+            bar: 48,
+            columns: 291,
+            rows: 72,
+        };
+        assert_eq!(solve(&window), Some((13, 28)));
+        // the numbers as they were given are of no whole cell
+        let virtualised = Facts {
+            client: (2560, 1392),
+            bar: 32,
+            ..window
+        };
+        assert_eq!(solve(&virtualised), None);
     }
 }

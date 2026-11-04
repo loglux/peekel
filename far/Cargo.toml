@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 peekel-core = { path = "../core" }
+peekel-term = { version = "0.5.0", path = "../term" }
 # the picture type core's decoders give (no codecs of its own are wanted here)
 image = { version = "0.25.10", default-features = false }
 
@@ -24,8 +25,6 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Imaging",
     "Win32_System_Com",
-    "Win32_System_Console",
-    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

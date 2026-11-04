@@ -69,6 +69,10 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
     FONTS
         .get_or_init(|| {
             let mut db = usvg::fontdb::Database::new();
+            // the user's own fonts first, then those the program was given, then the system's (`fontset`)
+            for dir in crate::fontset::dirs() {
+                db.load_fonts_dir(dir);
+            }
             db.load_system_fonts();
             if let Some(family) = installed(
                 &db,

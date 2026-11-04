@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::api::{InputRecord, KEY_EVENT, WINDOW_BUFFER_SIZE_EVENT};
 use crate::draw;
 use crate::log;
-use crate::realcell;
+use peekel_term::realcell;
 
 /// What a cell is taken as when nothing is known: the default of Windows Terminal's font at 100 % scaling.
 const DEFAULT: (usize, usize) = (10, 20);
@@ -38,6 +38,8 @@ static MEASURED: AtomicU32 = AtomicU32::new(0);
 static REAL: AtomicU32 = AtomicU32::new(0);
 /// The console was resized since the last question about the cell.
 static RESIZED: AtomicBool = AtomicBool::new(false);
+/// With `PEEKEL_CELL` given: the real cell has been looked for at least once (see `real` and `look_when_due`).
+static LOOKED: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
     waiting_since: None,
     reader: Reader::new(),
@@ -168,6 +170,10 @@ pub fn real() -> Option<(usize, usize)> {
     if crate::draw::off("aspect") {
         return None;
     }
+    // with `PEEKEL_CELL` nothing is asked of the terminal, so no answer comes to start the look at the window: the first use does
+    if given().is_some() && !LOOKED.swap(true, Ordering::SeqCst) {
+        look_at_the_window();
+    }
     match REAL.load(Ordering::SeqCst) {
         0 => None,
         packed => Some(((packed >> 16) as usize, (packed & 0xFFFF) as usize)),
@@ -190,6 +196,28 @@ fn look_at_the_window() {
             None => log::line("the real cell is the shape the terminal tells, or is not known"),
         }
     }
+}
+
+/// The colour the pictures are laid on (the panel's background), as `PEEKEL_BG` gives it by hand: `#0037DA`, `0037DA` or `0,55,218`.
+/// For the one who stopped the questions to the terminal with `PEEKEL_CELL`, and so has no palette from it: the colour the terminal
+/// shows Far's blue in is in the settings of the terminal (the colour schemes). None when the variable is not set or is not a colour.
+pub fn given_background() -> Option<[u8; 3]> {
+    parse_background(&std::env::var("PEEKEL_BG").ok()?)
+}
+
+fn parse_background(text: &str) -> Option<[u8; 3]> {
+    let text = text.trim();
+    if text.contains(',') {
+        let mut channels = text.split(',').map(|c| c.trim().parse::<u8>().ok());
+        let colour = [channels.next()??, channels.next()??, channels.next()??];
+        return channels.next().is_none().then_some(colour);
+    }
+    let hex = text.trim_start_matches('#');
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
 }
 
 /// The size an answer `ESC [ 6 ; height ; width t` tells, as (width, height), if it is a whole sane one.
@@ -308,10 +336,32 @@ pub fn takes(record: &InputRecord) -> bool {
     }
 }
 
+/// With `PEEKEL_CELL` given: looks at the window again when the layout of the panels or the size of the console changed (a font or a
+/// scale that is changed does that), and every so often, as the question about the cell is asked in the other mode. Nothing is written.
+fn look_when_due(layout: [i32; 8]) {
+    let Ok(mut state) = STATE.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let resized = RESIZED.swap(false, Ordering::SeqCst);
+    let changed = resized || state.layout != Some(layout);
+    state.layout = Some(layout);
+    let due = state.last_asked.is_none_or(|at| now.duration_since(at) >= EVERY);
+    if changed || due {
+        state.last_asked = Some(now);
+        drop(state);
+        LOOKED.store(true, Ordering::SeqCst);
+        look_at_the_window();
+    }
+}
+
 /// Asks the question, if a layout change or the time calls for it and the user is not typing. `layout` is the frames of
 /// the panels (left, top, right, bottom of both).
 pub fn tick(layout: [i32; 8]) {
     if given().is_some() {
+        // nothing is asked of the terminal (the answers begin with an Escape that a Far macro on Esc may take for a key), but the real
+        // cell is worked out from the window as before: the answer of the terminal was never needed for that
+        look_when_due(layout);
         return;
     }
     let Ok(mut state) = STATE.lock() else {
@@ -430,6 +480,54 @@ mod tests {
         assert_eq!(palette_colour(7), Some([7, 0, 0]));
         set_palette([None; 16]);
         assert_eq!(palette_colour(1), None);
+    }
+
+    #[test]
+    fn a_colour_given_by_hand_is_read_in_hex_or_as_three_numbers() {
+        assert_eq!(parse_background("#0037DA"), Some([0, 55, 218]));
+        assert_eq!(parse_background("0037da"), Some([0, 55, 218]));
+        assert_eq!(parse_background(" 0, 55 ,218 "), Some([0, 55, 218]));
+        assert_eq!(parse_background("#0037D"), None);
+        assert_eq!(parse_background("0,55"), None);
+        assert_eq!(parse_background("0,55,218,1"), None);
+        assert_eq!(parse_background("0,55,256"), None);
+        assert_eq!(parse_background("blue"), None);
+        assert_eq!(parse_background(""), None);
+        assert_eq!(
+            parse_background("#00é7DA"),
+            None,
+            "no panic on a letter that is more than one byte"
+        );
+    }
+
+    /// The variables of the environment are the process's, and these tests change them: one at a time.
+    static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn with_the_cell_given_the_real_cell_given_by_hand_is_taken_though_the_terminal_is_never_asked() {
+        let _alone = ENVIRONMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the tests that change the environment hold `ENVIRONMENT`, and no other test reads these variables
+        unsafe {
+            std::env::set_var("PEEKEL_CELL", "10x20");
+            std::env::set_var("PEEKEL_REAL_CELL", "13x28");
+        }
+        REAL.store(0, Ordering::SeqCst);
+        LOOKED.store(false, Ordering::SeqCst);
+        assert_eq!(
+            real(),
+            Some((13, 28)),
+            "the first use looks at the window, and the size given by hand wins"
+        );
+        // the same cell as the terminal tells: nothing to correct
+        unsafe { std::env::set_var("PEEKEL_REAL_CELL", "10x20") };
+        look_when_due([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(real(), None);
+        unsafe {
+            std::env::remove_var("PEEKEL_CELL");
+            std::env::remove_var("PEEKEL_REAL_CELL");
+        }
+        REAL.store(0, Ordering::SeqCst);
+        LOOKED.store(false, Ordering::SeqCst);
     }
 
     #[test]

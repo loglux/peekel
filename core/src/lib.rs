@@ -5,14 +5,17 @@
 pub mod archive;
 pub mod card;
 pub mod color;
+pub mod dds;
 pub mod decode;
 pub mod djvu;
 pub mod docx;
 pub mod exif;
 pub mod font;
+pub mod fontset;
 mod guard;
 pub mod icc;
 pub mod info;
+pub mod jxl;
 mod office;
 pub mod page;
 pub mod pdf;

@@ -11,6 +11,10 @@ publish.workspace = true
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+# DDS in Rust (MIT; BC1-BC7 by bcdec_rs, safe Rust); decoding only: the encoder feature brings a C library
+image_dds = { version = "0.7.2", default-features = false, features = ["ddsfile", "image"] }
+# JPEG XL in Rust (MIT or Apache 2.0); no rayon (the program makes its own threads), its colour management by moxcms, which is here already
+jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms"] }
 # already in the tree (png and usvg use it): gzipped SVGs are unpacked here, with a limit, not by usvg without one
 flate2 = "1.1"
 peekel-djvu = { path = "../djvu" }

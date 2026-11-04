@@ -265,6 +265,35 @@ impl<'d, 'a: 'd> Page<'d, 'a> {
         self.form.chunks(id)
     }
 
+    /// The text of the page, if it has a text layer (`TXTz`, else `TXTa`). A page that was never read for text has none.
+    ///
+    /// # Errors
+    /// The errors of [`crate::text::parse`].
+    pub fn text(&self) -> Result<Option<String>, Error> {
+        let chunk = self
+            .form
+            .first_chunk(*b"TXTz")
+            .or_else(|| self.form.first_chunk(*b"TXTa"));
+        chunk.map(|c| crate::text::parse(c.id, c.data)).transpose()
+    }
+
+    /// The words of the text layer with where each stands on the page (in the pixels of the page, the origin at the top left), or the
+    /// lines when the zones go no deeper. `None` when the page has no text layer or its text has no zones.
+    ///
+    /// # Errors
+    /// The errors of [`crate::text::words`].
+    pub fn words(&self) -> Result<Option<Vec<crate::text::Word>>, Error> {
+        let chunk = self
+            .form
+            .first_chunk(*b"TXTz")
+            .or_else(|| self.form.first_chunk(*b"TXTa"));
+        let height = i32::from(self.info.height);
+        match chunk {
+            Some(c) => crate::text::words(c.id, c.data, height),
+            None => Ok(None),
+        }
+    }
+
     /// The names the page gives in its `INCL` chunks, as bytes: padding (NUL, white space) at the end taken off, nothing else
     /// done to them (a name need not be text; the names in the directory are compared as the same bytes).
     pub fn included_names(&self) -> Vec<&'a [u8]> {

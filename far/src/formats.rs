@@ -259,16 +259,21 @@ mod tests {
         let all = [
             codec("PNG Decoder", &[".png"]),
             codec("Microsoft HEIF Decoder", &[".heic", ".heif", ".avif"]),
+            codec("Microsoft HD Photo Decoder", &[".wdp", ".jxr"]),
             codec("Microsoft JPEG XL Decoder", &[".jxl"]),
         ];
         let shown = text(Some(&all), "9.9.9");
         assert!(shown.starts_with("Peekel 9.9.9: formats"));
         assert!(shown.contains("PNG JPEG GIF"));
         assert!(shown.contains("Microsoft HEIF Decoder: .heic .heif .avif"));
-        assert!(shown.contains("Microsoft JPEG XL Decoder: .jxl"));
+        assert!(shown.contains("Microsoft HD Photo Decoder: .wdp .jxr"));
         assert!(
             !shown.contains("PNG Decoder"),
             "core reads PNG: Windows' decoder is not listed"
+        );
+        assert!(
+            !shown.contains("Microsoft JPEG XL Decoder"),
+            "core reads JPEG XL since 3 November 2026: Windows' decoder is not listed"
         );
     }
 
@@ -299,6 +304,7 @@ mod tests {
         ] {
             assert!(core_reads(e), "{e}");
         }
-        assert!(!core_reads("heic") && !core_reads("jxl"));
+        assert!(!core_reads("heic") && !core_reads("avif") && !core_reads("jxr"));
+        assert!(core_reads("jxl"), "JPEG XL is read by core (jxl-oxide)");
     }
 }

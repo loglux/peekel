@@ -279,10 +279,12 @@ pub fn describe() -> String {
     let (w, h) = cell();
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".into());
     format!(
-        "cell {w}x{h} px, real cell {:?}, PEEKEL_CELL={}, PEEKEL_REAL_CELL={}, PEEKEL_OFF={}, WT_SESSION set: {}, TERM_PROGRAM={}",
+        "cell {w}x{h} px, real cell {:?}, PEEKEL_CELL={}, PEEKEL_REAL_CELL={}, PEEKEL_BG={} (read as {:?}), PEEKEL_OFF={}, WT_SESSION set: {}, TERM_PROGRAM={}",
         crate::cell::real(),
         var("PEEKEL_CELL"),
         var("PEEKEL_REAL_CELL"),
+        var("PEEKEL_BG"),
+        crate::cell::given_background(),
         var("PEEKEL_OFF"),
         std::env::var_os("WT_SESSION").is_some(),
         var("TERM_PROGRAM")
@@ -547,7 +549,9 @@ pub fn tick() {
         real: crate::cell::real(),
         from_plugin,
         info,
-        background: api::panel_colour().map_or([0, 0, 0], |c| c.background_rgb()),
+        // `PEEKEL_BG` by hand first (for the one who stopped the questions to the terminal), else the panel's colour as the terminal said it
+        background: crate::cell::given_background()
+            .unwrap_or_else(|| api::panel_colour().map_or([0, 0, 0], |c| c.background_rgb())),
     };
     crate::cell::tick([
         this.rect.left,

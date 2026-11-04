@@ -41,6 +41,14 @@ pub fn width_scale(picture: Size, room: Room) -> f64 {
     room.0 as f64 / f64::from(picture.0)
 }
 
+/// A zoom and a position that do not depend on the picture's size: how wide the picture is drawn (1.0: as wide as the room) and
+/// where the middle of the window is (0 to 1 each way).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Relative {
+    pub width_part: f64,
+    pub center: (f64, f64),
+}
+
 /// A zoom and a position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
@@ -64,6 +72,32 @@ impl View {
             Zoom::Fit => fit_scale(picture, room).min(1.0),
             Zoom::Scale(s) => s,
         }
+    }
+
+    /// This view in terms that hold for a picture of another size: the scale as a part of the width scale and the centre as a part of
+    /// the picture. `None` for the whole picture (there is nothing to keep).
+    pub fn relative(&self, picture: Size, room: Room) -> Option<Relative> {
+        match self.zoom {
+            Zoom::Fit => None,
+            Zoom::Scale(s) => Some(Relative {
+                width_part: s / width_scale(picture, room),
+                center: (
+                    self.center.0 / f64::from(picture.0),
+                    self.center.1 / f64::from(picture.1),
+                ),
+            }),
+        }
+    }
+
+    /// The same zoom and place on another picture (a page of the same book, say), kept inside it.
+    pub fn from_relative(relative: Relative, picture: Size, room: Room) -> Self {
+        let mut view = Self::new(picture);
+        view.center = (
+            relative.center.0 * f64::from(picture.0),
+            relative.center.1 * f64::from(picture.1),
+        );
+        view.set_scale(relative.width_part * width_scale(picture, room), picture, room);
+        view
     }
 
     /// Back to the whole picture, centred.
@@ -146,6 +180,16 @@ impl Image {
         self.levels.first().map_or((0, 0), RgbaImage::dimensions)
     }
 
+    /// The picture turned clockwise by `quarters` quarter turns (any number; 4 is no turn). The halved copies are dropped: they are
+    /// made again, from the turned picture, when they are wanted.
+    #[must_use]
+    pub fn turned(mut self, quarters: i32) -> Self {
+        let Some(first) = self.levels.drain(..).next() else {
+            return self;
+        };
+        Self::new(turned_rgba(first, quarters))
+    }
+
     /// The copy halved `wanted` times, or the smallest that exists when it cannot be halved that often.
     fn level(&mut self, wanted: usize) -> &RgbaImage {
         while self.levels.len() <= wanted {
@@ -159,6 +203,55 @@ impl Image {
         let k = wanted.min(self.levels.len().saturating_sub(1));
         &self.levels[k]
     }
+}
+
+/// A picture turned clockwise by `quarters` quarter turns (any number; 4 is no turn).
+pub fn turned_rgba(picture: RgbaImage, quarters: i32) -> RgbaImage {
+    match quarters.rem_euclid(4) {
+        1 => imageops::rotate90(&picture),
+        2 => imageops::rotate180(&picture),
+        3 => imageops::rotate270(&picture),
+        _ => picture,
+    }
+}
+
+/// The most pixels a spread may have (the pages side by side): about 600 MB as RGBA.
+pub const SPREAD_MAX_PIXELS: u64 = 150_000_000;
+
+/// The pages side by side in one picture, the first at the left, separated by a clear gap of a hundredth of the height. With `equal_height`
+/// the shorter pages are enlarged to the height of the tallest, so that the lines of the text are as big on one page as on the other;
+/// without it each page keeps its own size and they hang from the top. `None` when there are no pages or the spread would have more
+/// than [`SPREAD_MAX_PIXELS`] (the caller shows the pages one by one then).
+pub fn side_by_side(pages: &[RgbaImage], equal_height: bool) -> Option<RgbaImage> {
+    let height = pages.iter().map(RgbaImage::height).max()?;
+    let scaled: Vec<(u32, u32)> = pages
+        .iter()
+        .map(|p| {
+            if equal_height && p.height() != height && p.height() > 0 {
+                let width = (f64::from(p.width()) * f64::from(height) / f64::from(p.height())).round() as u32;
+                (width.max(1), height)
+            } else {
+                p.dimensions()
+            }
+        })
+        .collect();
+    let gap = (height / 100).max(2);
+    let width = scaled.iter().map(|s| u64::from(s.0)).sum::<u64>() + u64::from(gap) * (pages.len() as u64 - 1);
+    if width == 0 || width * u64::from(height) > SPREAD_MAX_PIXELS || width > u64::from(u32::MAX) {
+        return None;
+    }
+    let mut out = RgbaImage::new(width as u32, height);
+    let mut x = 0i64;
+    for (page, size) in pages.iter().zip(scaled) {
+        if size == page.dimensions() {
+            imageops::replace(&mut out, page, x, 0);
+        } else {
+            let resized = imageops::resize(page, size.0, size.1, FilterType::Triangle);
+            imageops::replace(&mut out, &resized, x, 0);
+        }
+        x += i64::from(size.0) + i64::from(gap);
+    }
+    Some(out)
 }
 
 /// What the window shows.
@@ -229,6 +322,56 @@ mod tests {
 
     fn red_at(frame: &Frame, x: usize, y: usize) -> u32 {
         (frame.picture.argb[y * frame.picture.width + x] >> 16) & 255
+    }
+
+    #[test]
+    fn pages_side_by_side_are_one_picture_with_a_gap_and_the_shorter_enlarged_to_the_height_of_the_tallest() {
+        let left = RgbaImage::from_pixel(100, 200, Rgba([255, 0, 0, 255]));
+        let right = RgbaImage::from_pixel(50, 100, Rgba([0, 0, 255, 255]));
+        // gap: a hundredth of 200 is 2
+        let equal = side_by_side(&[left.clone(), right.clone()], true).expect("a spread");
+        assert_eq!(equal.dimensions(), (100 + 2 + 100, 200));
+        assert_eq!(equal.get_pixel(10, 10), &Rgba([255, 0, 0, 255]));
+        assert_eq!(equal.get_pixel(101, 10), &Rgba([0, 0, 0, 0]), "the gap is clear");
+        assert_eq!(
+            equal.get_pixel(150, 190),
+            &Rgba([0, 0, 255, 255]),
+            "the right page reaches the bottom"
+        );
+        // its own size, hanging from the top
+        let own = side_by_side(&[left, right], false).expect("a spread");
+        assert_eq!(own.dimensions(), (100 + 2 + 50, 200));
+        assert_eq!(own.get_pixel(110, 50), &Rgba([0, 0, 255, 255]));
+        assert_eq!(
+            own.get_pixel(110, 150),
+            &Rgba([0, 0, 0, 0]),
+            "nothing under the shorter page"
+        );
+    }
+
+    #[test]
+    fn no_pages_make_no_spread_and_one_page_is_itself() {
+        assert!(side_by_side(&[], true).is_none());
+        let one = side_by_side(&[RgbaImage::new(3, 4)], true).expect("a spread");
+        assert_eq!(one.dimensions(), (3, 4));
+    }
+
+    #[test]
+    fn a_view_is_carried_to_a_picture_of_another_size_by_its_width_and_its_place() {
+        let page = (2000, 3000);
+        let mut view = View::new(page);
+        view.fit_width(page, ROOM);
+        view.zoom_by(1.25, page, ROOM);
+        view.pan(0.0, 400.0, page, ROOM);
+        let relative = view.relative(page, ROOM).expect("a zoomed view");
+        assert!((relative.width_part - 1.25).abs() < 1e-9);
+
+        let other = (2100, 3300);
+        let carried = View::from_relative(relative, other, ROOM);
+        assert!((carried.scale(other, ROOM) - 1.25 * 1000.0 / 2100.0).abs() < 1e-9);
+        assert!((carried.center.1 / 3300.0 - view.center.1 / 3000.0).abs() < 1e-9);
+        // the whole picture has nothing to carry
+        assert_eq!(View::new(page).relative(page, ROOM), None);
     }
 
     #[test]
@@ -364,5 +507,27 @@ mod tests {
         let (left, right) = (red_at(&frame, 0, 250), red_at(&frame, 999, 250));
         assert!(left <= 2 && right >= 248, "{left} .. {right}");
         assert!(image.levels.len() >= 3, "halved twice or more: {}", image.levels.len());
+    }
+
+    #[test]
+    fn a_picture_turned_clockwise_has_its_sides_swapped_and_its_pixels_where_a_turn_puts_them() {
+        // red at the top left, blue at the top right of a 2 x 1 picture: turned clockwise the red is at the top, the blue under it
+        let mut picture = RgbaImage::new(2, 1);
+        picture.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        picture.put_pixel(1, 0, Rgba([0, 0, 255, 255]));
+        let right = Image::new(picture.clone()).turned(1);
+        assert_eq!(right.size(), (1, 2));
+        assert_eq!(right.levels[0].get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(right.levels[0].get_pixel(0, 1).0, [0, 0, 255, 255]);
+        // three quarters is a quarter back; four, or none, is no turn; half a turn reverses the row
+        assert_eq!(
+            Image::new(picture.clone()).turned(-1).levels[0].get_pixel(0, 0).0,
+            [0, 0, 255, 255]
+        );
+        assert_eq!(Image::new(picture.clone()).turned(4).levels[0], picture);
+        assert_eq!(
+            Image::new(picture.clone()).turned(2).levels[0].get_pixel(0, 0).0,
+            [0, 0, 255, 255]
+        );
     }
 }

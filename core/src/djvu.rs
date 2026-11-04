@@ -175,6 +175,147 @@ fn draw(data: &Arc<Vec<u8>>, index: usize, room: Option<(usize, usize)>) -> Resu
     Ok((image, count))
 }
 
+pub use peekel_djvu::text::{Rect, normalise};
+
+/// Marks on `image` (the page `page` of the file as `render_page` drew it) the words that `needle` (made by [`normalise`]) is in, as
+/// a highlighter does: the paper turns yellow and the print stays dark. How many words were marked. Nothing is marked when the page has
+/// no zones, or when the picture is not the size of the page's `INFO` (a turned page, a page drawn smaller: the zones are counted in the
+/// page's own pixels, and a picture that is another shape than the page is not guessed at).
+pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage) -> Result<usize, DecodeError> {
+    let Some((rects, (width, height))) = find_on_page(path, page, needle)? else {
+        return Ok(0);
+    };
+    if width == 0 || height == 0 || rects.is_empty() {
+        return Ok(0);
+    }
+    let (scale_x, scale_y) = (
+        f64::from(image.width()) / f64::from(width),
+        f64::from(image.height()) / f64::from(height),
+    );
+    if (scale_x - scale_y).abs() > 0.02 * scale_x {
+        return Ok(0);
+    }
+    for rect in &rects {
+        // one pixel of margin round the word at the picture's scale, so that the print at its edge is covered
+        let margin = scale_x.max(1.0);
+        let edge = |v: i32, scale: f64, by: f64, limit: u32| ((f64::from(v) * scale + by).max(0.0) as u32).min(limit);
+        let (left, right) = (
+            edge(rect.left, scale_x, -margin, image.width()),
+            edge(rect.right, scale_x, margin, image.width()),
+        );
+        let (top, bottom) = (
+            edge(rect.top, scale_y, -margin, image.height()),
+            edge(rect.bottom, scale_y, margin, image.height()),
+        );
+        for y in top..bottom {
+            for x in left..right {
+                let pixel = image.get_pixel_mut(x, y);
+                // multiplied by a yellow: blue goes down, red and green stay (a dark print stays dark)
+                pixel.0[2] = (u16::from(pixel.0[2]) * 90 / 255) as u8;
+            }
+        }
+    }
+    Ok(rects.len())
+}
+
+/// What a search finds on a page: the rectangles of the words, and the size of the page they are counted in.
+pub type Found = (Vec<Rect>, (u32, u32));
+
+/// Where a text stands on a page: the rectangles (in the pixels of the page, the origin at the top left) of the words that `needle`
+/// is in, and the size of the page (`INFO`) they are counted in. `needle` is made by [`normalise`]. `None` when the page has no
+/// text layer, or its text has no zones.
+pub fn find_on_page(path: &Path, page: usize, needle: &str) -> Result<Option<Found>, DecodeError> {
+    let data = bytes_of(path)?;
+    // on a thread of its own as the text is: a file made to hurt is an error and not the end of the caller
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("djvu words".to_string())
+            .stack_size(crate::guard::STACK)
+            .spawn_scoped(scope, || {
+                let document = Document::parse(&data).map_err(unreadable)?;
+                let page = document.page(page).map_err(unreadable)?;
+                let size = (u32::from(page.info.width), u32::from(page.info.height));
+                let words = page.words().map_err(unreadable)?;
+                Ok::<_, DecodeError>(words.map(|words| (peekel_djvu::text::locate(&words, needle), size)))
+            })
+            .map_err(unreadable)?
+            .join()
+            .unwrap_or_else(|_| Err(unreadable("the words could not be read")))
+    })
+}
+
+/// The text of every page of the file (an empty string for a page with no text layer), or `None` when no page has a text layer. A
+/// page whose text cannot be read counts as one without. For a search in the book.
+pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
+    let data = bytes_of(path)?;
+    // read on a thread of its own, so that a surprise in a file made to hurt is an error and not the end of the caller
+    let texts = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("djvu text".to_string())
+            .stack_size(crate::guard::STACK)
+            .spawn_scoped(scope, || {
+                let document = Document::parse(&data).map_err(unreadable)?;
+                let mut any = false;
+                let texts: Vec<String> = (0..document.page_count())
+                    .map(|index| {
+                        let text = document.page(index).ok().and_then(|p| p.text().ok().flatten());
+                        any |= text.is_some();
+                        text.unwrap_or_default()
+                    })
+                    .collect();
+                Ok::<_, DecodeError>(any.then_some(texts))
+            })
+            .map_err(unreadable)?
+            .join()
+            .unwrap_or_else(|_| Err(unreadable("the text could not be read")))
+    })?;
+    Ok(texts)
+}
+
+/// A line of the contents of a book: how deep it is (0 for the top level), its title, and the page (from 0) it leads to, if it leads to
+/// one of the book's pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentsItem {
+    pub depth: usize,
+    pub title: String,
+    pub page: Option<usize>,
+}
+
+/// The contents of the book (its bookmarks, `NAVM`) as lines in reading order, or `None` when it has none.
+pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
+    let data = bytes_of(path)?;
+    // read on a thread of its own, as the text is
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("djvu contents".to_string())
+            .stack_size(crate::guard::STACK)
+            .spawn_scoped(scope, || {
+                let document = Document::parse(&data).map_err(unreadable)?;
+                let Some(chunk) = document.bookmarks() else {
+                    return Ok(None);
+                };
+                let tree = peekel_djvu::nav::parse(chunk.data).map_err(unreadable)?;
+                let entries = document
+                    .directory()
+                    .map(|d| d.entries().unwrap_or_default())
+                    .unwrap_or_default();
+                let pages = document.page_count();
+                let items: Vec<ContentsItem> = peekel_djvu::nav::flatten(&tree)
+                    .into_iter()
+                    .map(|(depth, b)| ContentsItem {
+                        depth,
+                        title: b.title.clone(),
+                        page: peekel_djvu::nav::page_of(&b.address, &entries, pages),
+                    })
+                    .collect();
+                Ok::<_, DecodeError>((!items.is_empty()).then_some(items))
+            })
+            .map_err(unreadable)?
+            .join()
+            .unwrap_or_else(|_| Err(unreadable("the contents could not be read")))
+    })
+}
+
 /// What the card shows of a DjVu file: how many pages, and the size of the first as it is shown (a page that is stored turned a
 /// quarter has its width and height the other way round).
 pub fn properties(data: &[u8]) -> Vec<(String, String)> {

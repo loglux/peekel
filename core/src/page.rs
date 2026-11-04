@@ -123,10 +123,11 @@ fn family(name: Option<&str>) -> String {
         .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
         .collect();
     let clean = clean.trim();
+    // each family followed by the free font of its width, for a machine that has not the original (`fontset`)
     if clean.is_empty() {
-        "Segoe UI, Arial, sans-serif".to_string()
+        crate::fontset::expand("Segoe UI, Arial, sans-serif")
     } else {
-        format!("{clean}, Segoe UI, Arial, sans-serif")
+        crate::fontset::expand(&format!("{clean}, Segoe UI, Arial, sans-serif"))
     }
 }
 
