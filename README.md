@@ -116,44 +116,34 @@ variable before starting Far:
 |---|---|
 | `PEEKEL_FAR_LOG=<file>` | the plugin writes what it does to this file (send it with a bug report) |
 | `PEEKEL_OFF=hook` | switches the plugin off without removing it |
-| `PEEKEL_CELL=10x20` | the size of a terminal cell the plugin takes instead of asking the terminal; it also stops every question the plugin puts to the terminal (users whose Far macro on Esc misbehaved found that this helped), so the colour of the panels is not asked either: give it with `PEEKEL_BG` |
-| `PEEKEL_REAL_CELL=13x28` | the real size of a cell by hand, for a case where the plugin cannot work it out from the window (a split pane); in Windows Terminal it works it out by itself, with `PEEKEL_CELL` too |
-| `PEEKEL_BG=#0037DA` | the colour the pictures are laid on (the background of the panels) by hand; the colour of the panels as you see them (the "Blue" of your colour scheme in the settings of Windows Terminal is a good first guess: `#0037DA` in Campbell); a colour that is not the panels' shows as a strip at the picture's right and bottom edge |
+| `PEEKEL_CELL=10x20` | turns off the plugin's queries to the terminal; the size of the cell is worked out from the window |
+| `PEEKEL_REAL_CELL=13x28` | the size of a cell by hand, when the plugin cannot work it out from the window |
+| `PEEKEL_BG=#0037DA` | the colour of the panels as a HEX code; used when the terminal is not asked |
 
 There is no settings dialog yet; if you want to turn something off, say which.
 
-## Questions
+## Working with the macro on Esc
 
-**Why does the plugin put questions to the terminal?** To draw a picture the right size it needs two things that only the terminal knows: how
-many pixels a character cell has, and what colour the panels are (the picture is laid on that colour, so no strip of another colour shows round
-it). It asks Windows Terminal with escape sequences (what it is, the size of a cell, the 16 colours), and the terminal answers by typing escape
-sequences into the input; the plugin takes them out before Far sees them. It asks at the start, when the window or the font changes, and
-every 15 seconds while you are not typing.
+To draw a picture the right size, the plugin asks Windows Terminal for the size of a character cell in pixels and for the colour of the panels (the picture is laid on that colour, so no strip of another colour shows round it). The terminal answers with sequences that begin with Esc. Windows Terminal always reports the same cell size, 10 x 20, whatever the font is, while the real size depends on the font and the scale of the screen (for example Consolas at 150 % is 13 x 28). So the plugin works the real size out itself, from the window of the terminal, with the data of Windows.
 
-**Windows Terminal says a cell is 10 x 20. Is that wrong?** It says that always, with any font (the console host behind the terminal assumes
-it). The real cell depends on the font and on the scale of the screen: on the author's PC Consolas at 150 % has 13 x 28 pixels and Cascadia Code
-14 x 28. The terminal stretches a picture over the real cells, so with a font whose cell is not 1 : 2 a picture made for 10 x 20 comes out too
-tall (8 % with Consolas). So the plugin works the real cell out from what Windows says about the window of the terminal: the size of its
-client area, the scale of the screen, the height of the title bar, and how many columns and rows of text there are. It looks for the whole cell
-sizes that fit (allowing for the padding and the scroll bar), takes one only when there is exactly one and its shape is believable (between
-1 : 1.4 and 1 : 3), and in another terminal, in a split pane or when unsure it takes nothing and draws as it would without it. It is not a plain
-division of the width by the columns.
+The macro `Panel.Esc.lua` (it hides and shows the panels on Esc) interferes with this exchange. The answers of the terminal begin with Esc, and the macro acts on Esc. To use the macro with the plugin, set the two variables of the table above before starting Far:
 
-**A Far macro on Esc misbehaves with the plugin.** A macro that does something at every Esc on an empty command line (one that hides and shows
-the panels with Ctrl+O, for example) conflicts with the plugin: reported by two users and seen by the author. **The cause is a guess, not
-proved:** every answer of the terminal begins with an Escape, and the macro may take it for a key press. The way round is `PEEKEL_CELL=10x20`
-set before Far starts (one user set it in `_macroinit.lua`): the plugin then asks the terminal nothing. Since 0.5.0 it still works the real
-cell out from the window, so the pictures keep their proportions with any font; what it cannot know is the colour of the panels: it takes
-the console's default blue (`#000080`), and if your terminal shows Far's blue another way a strip of the other blue may show round a
-picture. Give the colour with `PEEKEL_BG`.
+- `PEEKEL_CELL=10x20`: the plugin stops asking the terminal, and the size of the cell is still worked out from the window.
+- `PEEKEL_BG=#0037DA`: the colour of the panels of your theme as a HEX code. Without it dark blue (`#000080`) is used, and a strip of that colour may show at the picture's edge.
 
-**Where do I find the colour for `PEEKEL_BG`?** Ask the terminal once: start Far in the usual way (without `PEEKEL_CELL`, and with the macro
-off for this one start) with `PEEKEL_FAR_LOG=<file>` set, open a picture, wait twenty seconds and close Far. The line "the terminal says its
-colours are [...]" of the log lists the colours of the terminal's palette as red, green and blue; Far's blue is the fifth one (the number 4,
-counted from 0). On the author's PC the terminal said `[0, 0, 128]` in one start, and the panels were `#000080`, while in other starts they were
-`#0037DA` (`[0, 55, 218]`, the Blue of the Campbell scheme): the colour can change, so if a strip of another colour shows at the picture's right
-and bottom edge, look again. It can be written `#0037DA`, `0037DA` or `0,55,218`. If you changed the colours of the panels in Far, it is the colour
-you gave them.
+Set the variables in a PowerShell window and start Far from that same window (put the path of your Far in place of `<path to Far.exe>`):
+
+```powershell
+$env:PEEKEL_CELL='10x20'; $env:PEEKEL_BG='#0037DA'; & "<path to Far.exe>"
+```
+
+If you do not know the colour of the panels, it can be taken from the plugin's log. Start Far once **without the macro** (turn it off for this one start: while the plugin asks the terminal, the macro interferes) and without `PEEKEL_CELL`, but with the variable `PEEKEL_FAR_LOG`, set in PowerShell, starting Far from that same window:
+
+```powershell
+$env:PEEKEL_FAR_LOG="$env:TEMP\peekel.log"; & "<path to Far.exe>"
+```
+
+Open a picture in the quick view, wait twenty seconds and close Far. In the file `peekel.log` the line "the terminal says its colours are [...]" lists the colours of the terminal's palette (red, green, blue); Far's blue is the fifth (number 4, counted from 0), for example `[0, 55, 218]`. Write it as a HEX code (`#0037DA`) or with commas (`0,55,218`), turn the macro on again and set `PEEKEL_BG`.
 
 ## Licence
 
