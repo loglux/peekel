@@ -16,7 +16,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use image::RgbaImage;
 use roxmltree::{Document, Node};
@@ -24,9 +23,10 @@ use roxmltree::{Document, Node};
 use crate::archive::Archive;
 use crate::color::hex;
 use crate::decode::DecodeError;
+use crate::flow::{self, Align, Atom, Layout, words};
 use crate::guard::{draw_on_thread, has_extension, read_limited, unreadable};
 use crate::office::{MAX_BYTES, MAX_PART, Pictures};
-use crate::page::{Font, Page, Rgb, text_width};
+use crate::page::{Font, Page, Rgb};
 use crate::xml::{self, attr, child, parse};
 
 /// Tables inside tables are laid out down to this depth: each level lays its cells out twice (to find the height of the
@@ -39,7 +39,6 @@ const MAX_ATOMS: usize = 20_000;
 /// A4 and one inch of margin, in points, for a document that says nothing.
 const A4: (f32, f32) = (595.3, 841.9);
 const MARGIN: f32 = 72.0;
-const TAB: f32 = 36.0;
 const CELL_PAD: f32 = 4.5;
 const MAX_COLUMNS: usize = 64;
 
@@ -100,14 +99,6 @@ fn twips(value: Option<&str>) -> Option<f32> {
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite())
         .map(|v| v / 20.0)
-}
-
-#[derive(Clone, Copy, PartialEq, Default, Debug)]
-enum Align {
-    #[default]
-    Left,
-    Center,
-    Right,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -392,24 +383,6 @@ fn geometry(body: Node<'_, '_>) -> Geometry {
 
 // ---- laying out -------------------------------------------------------------------------------------------------
 
-/// A piece of a paragraph's content.
-enum Atom {
-    /// A word and whether a space follows it.
-    Word {
-        text: String,
-        font: Font,
-        space: bool,
-    },
-    Picture {
-        image: Option<Arc<RgbaImage>>,
-        width: f32,
-        height: f32,
-    },
-    Tab,
-    Break,
-    PageBreak,
-}
-
 struct Doc<'a> {
     rels: HashMap<String, (String, String)>,
     styles: Styles,
@@ -512,16 +485,15 @@ impl Doc<'_> {
         });
     }
 
-    /// One paragraph: wrapped into lines and drawn from `y`; `y` is moved below it. False when the page is full.
+    /// One paragraph: its properties from its style and from itself, its content as atoms, then `flow` sets it; `y` is moved
+    /// below it. False when the page is full.
     fn paragraph(&self, node: Node<'_, '_>, x: f32, width: f32, y: &mut f32, bottom: f32, out: &mut Page) -> bool {
         let (own, style, numbered) = para_props(node);
         let (mut props, run) = self.styles.resolve(style.as_deref());
         props.over(&own);
-        let base_font = run.font();
         let mut atoms = Vec::new();
         self.atoms(node, &run, &mut atoms);
 
-        let line_factor = props.line.unwrap_or(1.0);
         let mut left = props.left.unwrap_or(0.0).clamp(0.0, width * 0.8);
         if numbered && props.left.is_none() {
             left = 18.0;
@@ -530,192 +502,17 @@ impl Doc<'_> {
             .first
             .unwrap_or(if numbered { -12.0 } else { 0.0 })
             .clamp(-left, width * 0.5);
-        let align = props.align.unwrap_or_default();
-        *y += props.before.unwrap_or(0.0).clamp(0.0, 200.0);
-
-        // the units that cannot be broken inside: words joined with no space between them, a picture, a tab
-        let mut lines: Vec<Vec<Atom>> = vec![Vec::new()];
-        let mut line_width = 0.0f32;
-        let mut line_index = 0usize;
-        let mut unit: Vec<Atom> = Vec::new();
-        let mut page_break = false;
-        let available = |line: usize| (width - left - if line == 0 { first } else { 0.0 }).max(20.0);
-        let too_long = |a: &Atom| atom_width(a, false) > available(1) * 1.2;
-        let flush_unit =
-            |unit: &mut Vec<Atom>, lines: &mut Vec<Vec<Atom>>, line_width: &mut f32, line_index: &mut usize| {
-                if unit.is_empty() {
-                    return;
-                }
-                let w: f32 = unit.iter().map(|a| atom_width(a, false)).sum();
-                if *line_width + w > available(*line_index) && lines.last().is_some_and(|l| !l.is_empty()) {
-                    // the space that ended the last word of the line is not part of its width
-                    lines.push(Vec::new());
-                    *line_width = 0.0;
-                    *line_index += 1;
-                }
-                *line_width += unit.iter().map(|a| atom_width(a, true)).sum::<f32>();
-                if let Some(line) = lines.last_mut() {
-                    line.append(unit);
-                }
-            };
-        for atom in atoms {
-            match atom {
-                Atom::Break => {
-                    flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                    lines.push(Vec::new());
-                    line_width = 0.0;
-                    line_index += 1;
-                }
-                Atom::PageBreak => {
-                    flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                    page_break = true;
-                    break;
-                }
-                Atom::Tab | Atom::Picture { .. } => {
-                    flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                    unit.push(atom);
-                    flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                }
-                Atom::Word { .. } if too_long(&atom) => {
-                    // a word wider than a line (a web address) is broken where the line ends, as Word does
-                    if let Atom::Word { text, font, space } = atom {
-                        let limit = available(1);
-                        let mut chunks: Vec<String> = vec![String::new()];
-                        for c in text.chars() {
-                            let current = chunks.last().cloned().unwrap_or_default();
-                            if !current.is_empty() && text_width(&format!("{current}{c}"), &font) > limit {
-                                chunks.push(String::new());
-                            }
-                            if let Some(last) = chunks.last_mut() {
-                                last.push(c);
-                            }
-                        }
-                        let count = chunks.len();
-                        for (i, chunk) in chunks.into_iter().enumerate() {
-                            unit.push(Atom::Word {
-                                text: chunk,
-                                font: font.clone(),
-                                space: space && i + 1 == count,
-                            });
-                            flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                        }
-                    }
-                }
-                Atom::Word { space, .. } => {
-                    unit.push(atom);
-                    if space {
-                        flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-                    }
-                }
-            }
-        }
-        flush_unit(&mut unit, &mut lines, &mut line_width, &mut line_index);
-
-        let marker = numbered.then(|| Font {
-            bold: false,
-            ..base_font.clone()
-        });
-        let mut fits = true;
-        let mut first_on_page = true;
-        for (index, line) in lines.iter().enumerate() {
-            // the height of the line: its biggest text or picture
-            let size = line
-                .iter()
-                .filter_map(|a| match a {
-                    Atom::Word { font, .. } => Some(font.size),
-                    _ => None,
-                })
-                .fold(base_font.size, f32::max);
-            let tallest = line
-                .iter()
-                .filter_map(|a| match a {
-                    Atom::Picture { height, .. } => Some(*height),
-                    _ => None,
-                })
-                .fold(0.0, f32::max);
-            let ascent = (size * 0.95).max(tallest);
-            let height = (ascent + size * 0.25) * line_factor;
-            if *y + height > bottom && !(first_on_page && *y <= bottom && out.is_empty()) {
-                fits = false;
-                break;
-            }
-            first_on_page = false;
-            let baseline = *y + height - size * 0.25 * line_factor;
-            let start = x + left + if index == 0 { first } else { 0.0 };
-            let used: f32 = line.iter().map(|a| atom_width(a, false)).sum::<f32>();
-            let room = available(index);
-            let mut cursor = match align {
-                Align::Left => start,
-                Align::Center => start + ((room - used) / 2.0).max(0.0),
-                Align::Right => start + (room - used).max(0.0),
-            };
-            if index == 0
-                && let Some(font) = &marker
-            {
-                out.text(start - 12.0_f32.max(-first), baseline, "\u{2022}", font);
-            }
-            self.draw_line(line, &mut cursor, baseline, start, room, out);
-            *y += height;
-        }
-        *y += props.after.unwrap_or(0.0).clamp(0.0, 200.0);
-        fits && !page_break
-    }
-
-    /// The atoms of one line: the words between two tabs or pictures are one line of text made of pieces in their own
-    /// fonts, which the renderer sets with the real widths (the widths here are only a guess, for wrapping).
-    fn draw_line(&self, line: &[Atom], cursor: &mut f32, baseline: f32, start: f32, room: f32, out: &mut Page) {
-        let mut runs: Vec<(String, Font)> = Vec::new();
-        let mut from = *cursor;
-        let flush = |runs: &mut Vec<(String, Font)>, from: f32, out: &mut Page| {
-            if let Some((text, _)) = runs.last_mut() {
-                let trimmed = text.trim_end().len();
-                text.truncate(trimmed);
-            }
-            out.runs(from, baseline, std::mem::take(runs));
+        let set = Layout {
+            align: props.align.unwrap_or_default(),
+            before: props.before.unwrap_or(0.0).clamp(0.0, 200.0),
+            after: props.after.unwrap_or(0.0).clamp(0.0, 200.0),
+            line_factor: props.line.unwrap_or(1.0),
+            left,
+            first,
+            bullet: numbered,
+            font: run.font(),
         };
-        for atom in line {
-            match atom {
-                Atom::Word { text, font, space } => {
-                    if runs.last().is_none_or(|(_, f)| f != font) {
-                        runs.push((String::new(), font.clone()));
-                    }
-                    if let Some((piece, _)) = runs.last_mut() {
-                        piece.push_str(text);
-                        if *space {
-                            piece.push(' ');
-                        }
-                    }
-                    *cursor += atom_width(atom, true);
-                }
-                Atom::Tab => {
-                    flush(&mut runs, from, out);
-                    let rel = *cursor - start;
-                    *cursor = start + ((rel / TAB).floor() + 1.0) * TAB;
-                    from = *cursor;
-                }
-                Atom::Picture { image, width, height } => {
-                    flush(&mut runs, from, out);
-                    // wider than the line: shrunk to it, in proportion
-                    let shrink = (room / width).min(1.0);
-                    let (w, h) = (width * shrink, height * shrink);
-                    match image {
-                        Some(image) => out.picture(*cursor, baseline - h, w, h, Arc::clone(image)),
-                        None => out.rect(
-                            *cursor,
-                            baseline - h,
-                            w,
-                            h,
-                            Some([235, 235, 235]),
-                            Some(([170, 170, 170], 0.75)),
-                        ),
-                    }
-                    *cursor += w;
-                    from = *cursor;
-                }
-                Atom::Break | Atom::PageBreak => {}
-            }
-        }
-        flush(&mut runs, from, out);
+        flow::paragraph(atoms, &set, x, width, y, bottom, out)
     }
 
     /// A table: columns as the grid says (scaled to the room), rows as high as their tallest cell; false when a row does
@@ -839,47 +636,6 @@ impl Doc<'_> {
         }
         *y += 4.0;
         true
-    }
-}
-
-/// The width of an atom; `with_space` counts the space after a word.
-fn atom_width(atom: &Atom, with_space: bool) -> f32 {
-    match atom {
-        Atom::Word { text, font, space } => {
-            text_width(text, font)
-                + if *space && with_space {
-                    text_width(" ", font)
-                } else {
-                    0.0
-                }
-        }
-        Atom::Picture { width, .. } => *width,
-        Atom::Tab => 0.0,
-        Atom::Break | Atom::PageBreak => 0.0,
-    }
-}
-
-/// The words of a piece of text: a space after each, and one before the first when the text starts with white space.
-fn words(text: &str, font: &Font, atoms: &mut Vec<Atom>) {
-    let starts_with_space = text.starts_with(char::is_whitespace);
-    let ends_with_space = text.ends_with(char::is_whitespace);
-    if starts_with_space && let Some(Atom::Word { space, .. }) = atoms.last_mut() {
-        *space = true;
-    }
-    let pieces: Vec<&str> = text.split_whitespace().collect();
-    for (i, piece) in pieces.iter().enumerate() {
-        atoms.push(Atom::Word {
-            text: (*piece).to_string(),
-            font: font.clone(),
-            space: i + 1 < pieces.len() || ends_with_space,
-        });
-    }
-    // a text of nothing but white space is a space between what is around it
-    if pieces.is_empty()
-        && !text.is_empty()
-        && let Some(Atom::Word { space, .. }) = atoms.last_mut()
-    {
-        *space = true;
     }
 }
 

@@ -1,0 +1,7 @@
+Written for Peekel (4 November 2026); core/tests/hostile.rs uses it as the file to cut and spoil. No licence question.
+
+sample.odt  made by a python script of the author's session (zipfile), in the shape LibreOffice writes (a named heading style with a
+            parent, a body style, automatic styles for a bold red italic span and a centred paragraph, font declarations): a heading,
+            a paragraph with the spans, spaces, a tab, a list with a nested item and a line break, a table of two columns with
+            borders and a fill, a picture (a PNG made in the script) in the line. Not made by LibreOffice itself (none is installed
+            on this PC); files of LibreOffice itself were tried separately (docs/development.md).

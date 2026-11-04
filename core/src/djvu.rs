@@ -272,14 +272,7 @@ pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     Ok(texts)
 }
 
-/// A line of the contents of a book: how deep it is (0 for the top level), its title, and the page (from 0) it leads to, if it leads to
-/// one of the book's pages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentsItem {
-    pub depth: usize,
-    pub title: String,
-    pub page: Option<usize>,
-}
+pub use crate::decode::ContentsItem;
 
 /// The contents of the book (its bookmarks, `NAVM`) as lines in reading order, or `None` when it has none.
 pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {

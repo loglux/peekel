@@ -205,13 +205,13 @@ fn colour(node: Node<'_, '_>, theme: &[Rgb]) -> Option<Rgb> {
 }
 
 #[derive(Clone, Debug)]
-struct FontSpec {
-    size: f32,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    colour: Option<Rgb>,
-    family: Option<String>,
+pub(crate) struct FontSpec {
+    pub(crate) size: f32,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) colour: Option<Rgb>,
+    pub(crate) family: Option<String>,
 }
 
 impl Default for FontSpec {
@@ -228,13 +228,13 @@ impl Default for FontSpec {
 }
 
 #[derive(Clone, Debug, Default)]
-struct CellStyle {
-    format: u32,
-    font: usize,
-    fill: Option<Rgb>,
-    border: bool,
-    align: Option<String>,
-    wrap: bool,
+pub(crate) struct CellStyle {
+    pub(crate) format: u32,
+    pub(crate) font: usize,
+    pub(crate) fill: Option<Rgb>,
+    pub(crate) border: bool,
+    pub(crate) align: Option<String>,
+    pub(crate) wrap: bool,
 }
 
 #[derive(Default)]
@@ -748,22 +748,22 @@ fn number_text(value: f64, code: &str) -> String {
 
 // ---- the sheet --------------------------------------------------------------------------------------------------
 
-struct Cell {
-    row: usize,
-    column: usize,
-    text: String,
-    number: bool,
-    style: CellStyle,
-    font: FontSpec,
+pub(crate) struct Cell {
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) text: String,
+    pub(crate) number: bool,
+    pub(crate) style: CellStyle,
+    pub(crate) font: FontSpec,
 }
 
-struct Grid {
-    cells: Vec<Cell>,
+pub(crate) struct Grid {
+    pub(crate) cells: Vec<Cell>,
     /// The width of each column and the height of each row that is shown, in points (hidden ones are 0).
-    widths: Vec<f32>,
-    heights: Vec<f32>,
+    pub(crate) widths: Vec<f32>,
+    pub(crate) heights: Vec<f32>,
     /// Merged ranges: (first row, first column, last row, last column), counted from 0.
-    merges: Vec<(usize, usize, usize, usize)>,
+    pub(crate) merges: Vec<(usize, usize, usize, usize)>,
 }
 
 /// "B7" is (6, 1); "AA1" is (0, 26).
@@ -925,7 +925,7 @@ impl Grid {
         }
     }
 
-    fn render(&self) -> Result<RgbaImage, DecodeError> {
+    pub(crate) fn render(&self) -> Result<RgbaImage, DecodeError> {
         // the room each column and row takes, up to what is drawn
         let last_row = self.cells.iter().map(|c| c.row).max().unwrap_or(0);
         let last_column = self.cells.iter().map(|c| c.column).max().unwrap_or(0);

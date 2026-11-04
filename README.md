@@ -5,7 +5,7 @@
 ![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview-v2.png)
 
 **Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, a DjVu book, the
-start of a Word, PowerPoint or Excel file, and a card for fonts, programs and archives.
+start of a Word, PowerPoint, Excel or OpenDocument file, and a card for fonts, programs and archives.
 
 A console viewer (for F3, Linux and Midnight Commander) works and is being prepared; it will be published a little later.
 
@@ -15,7 +15,7 @@ A console viewer (for F3, Linux and Midnight Commander) works and is being prepa
   over the files.
 - **No second window.** Peekel draws with Sixel graphics inside the terminal's own cells, so nothing floats over the console
   and has to be kept in place, and it works over SSH too.
-- **More than pictures.** A PDF, a DjVu book, the start of a Word, PowerPoint or Excel file, a card for a font (in its own letters), a
+- **More than pictures.** A PDF, a DjVu book, the start of a Word, PowerPoint, Excel or OpenDocument file, a card for a font (in its own letters), a
   program, a ZIP: the kind, size, dates, what is inside. When the name says nothing (a recovered `.chk` fragment) it tells what a
   file is by its content, and it warns when a name and the content disagree.
 - **Damaged files are safe.** The size, the time and the depth of reading are limited; a broken file gives a message, not a
@@ -69,6 +69,7 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | PDF (text pages and scans; not password-protected) | the first page |
 | DjVu (scanned books) | the first page; the card gives the number of pages and the size of the page (read by a reader of our own, written from the format's open specification; not read yet: the text layer and documents whose pages are separate files) |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
+| OpenDocument: text (.odt), spreadsheet (.ods), presentation (.odp) | the start, the top of the sheet, the first slide |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
 | Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |
 

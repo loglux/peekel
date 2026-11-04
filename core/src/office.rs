@@ -61,3 +61,10 @@ impl<'a> Pictures<'a> {
         made
     }
 }
+
+/// Whether an OpenDocument package says that its parts are encrypted (a password): the manifest names the encryption of a part.
+pub fn is_encrypted(archive: &Archive<'_>) -> bool {
+    archive
+        .text("META-INF/manifest.xml", 4 * 1024 * 1024)
+        .is_some_and(|manifest| manifest.contains("encryption-data"))
+}

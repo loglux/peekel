@@ -68,7 +68,7 @@ struct Special {
     draw: fn(&Path) -> Result<RgbaImage, DecodeError>,
 }
 
-const SPECIAL: [Special; 9] = [
+const SPECIAL: [Special; 12] = [
     Special {
         is: crate::raw::is_raw,
         draw: crate::raw::render,
@@ -96,6 +96,18 @@ const SPECIAL: [Special; 9] = [
     Special {
         is: crate::docx::is_docx,
         draw: crate::docx::render_first_page,
+    },
+    Special {
+        is: crate::odt::is_odt,
+        draw: crate::odt::render_first_page,
+    },
+    Special {
+        is: crate::ods::is_ods,
+        draw: crate::ods::render_first_page,
+    },
+    Special {
+        is: crate::odp::is_odp,
+        draw: crate::odp::render_first_page,
     },
     Special {
         is: crate::pptx::is_pptx,
@@ -130,11 +142,23 @@ pub fn decode_full(path: &Path) -> Result<RgbaImage, DecodeError> {
     decode_reader(ImageReader::open(path).map_err(unreadable)?, MAX_PIXELS, 1)
 }
 
-/// The contents of a book (its bookmarks), for a list to jump from: `Some` for a DjVu book that has them; `None` for a book with none and
-/// for the kinds of file whose contents are not read yet (a PDF).
-pub fn contents(path: &Path) -> Result<Option<Vec<crate::djvu::ContentsItem>>, DecodeError> {
+/// A line of the contents of a book: how deep it is (0 for the top level), its title, and the page (from 0) it leads to, if it leads to
+/// one of the book's pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentsItem {
+    pub depth: usize,
+    pub title: String,
+    pub page: Option<usize>,
+}
+
+/// The contents of a book (its bookmarks), for a list to jump from: `Some` for a DjVu book or a PDF that has them; `None` for a book with
+/// none and for the kinds of file that have no contents.
+pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
     if crate::djvu::is_djvu(path) {
         return crate::djvu::contents(path);
+    }
+    if crate::pdf::is_pdf(path) {
+        return crate::pdf_outline::contents(path);
     }
     Ok(None)
 }

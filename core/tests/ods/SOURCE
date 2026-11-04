@@ -1,0 +1,5 @@
+Written for Peekel (4 November 2026); core/tests/hostile.rs uses it as the file to cut and spoil. No licence question.
+
+sample.ods  made by a python script of the author's session (zipfile), in the shape LibreOffice writes: a sheet of four rows with a bold
+            header on a fill, borders, numbers in green, a merged cell in a last row that says Total. Not made by LibreOffice itself;
+            files of LibreOffice Calc were tried separately (docs/development.md).

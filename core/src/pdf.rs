@@ -23,7 +23,7 @@ use crate::decode::DecodeError;
 use crate::guard::{STACK, has_extension, unreadable};
 
 /// A bigger file is refused before it is parsed.
-const MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// The longest side of the picture of a page.
 const SIDE: f32 = 2048.0;
 /// Neither side of the picture is longer than this (a page of absurd proportions would be a very long strip).
@@ -65,7 +65,10 @@ pub fn render_page_within(path: &Path, page: usize, timeout: Duration) -> Result
 
 /// Runs `job` on a thread of its own with a large stack and waits for it at most `timeout`; a panic of the job, and a job
 /// that takes longer, are errors (the thread of a job that is given up is left to end by itself).
-fn on_thread<T: Send + 'static>(timeout: Duration, job: impl FnOnce() -> T + Send + 'static) -> Result<T, DecodeError> {
+pub(crate) fn on_thread<T: Send + 'static>(
+    timeout: Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, DecodeError> {
     let (send, receive) = mpsc::channel();
     std::thread::Builder::new()
         .name("pdf".to_string())
@@ -88,25 +91,88 @@ pub fn properties(data: Vec<u8>) -> Vec<(String, String)> {
     on_thread(Duration::from_secs(5), move || read_properties(data)).unwrap_or_default()
 }
 
-/// A text of the PDF's information as a string: UTF-16 with a byte-order mark, UTF-8, or the 8-bit PDFDocEncoding.
-fn pdf_text(bytes: &[u8]) -> String {
+/// The characters of PDFDocEncoding (the specification's Annex D, Table D.2) that are not those of Latin-1: the codes 0x18 to 0x1F, 0x80 to
+/// 0x9E and 0xA0 (the last is in `text_string`). The codes 0x7F, 0x9F and 0xAD are undefined there.
+const PDF_DOC: [(u8, char); 39] = [
+    (0x18, '\u{2D8}'),
+    (0x19, '\u{2C7}'),
+    (0x1A, '\u{2C6}'),
+    (0x1B, '\u{2D9}'),
+    (0x1C, '\u{2DD}'),
+    (0x1D, '\u{2DB}'),
+    (0x1E, '\u{2DA}'),
+    (0x1F, '\u{2DC}'),
+    (0x80, '\u{2022}'),
+    (0x81, '\u{2020}'),
+    (0x82, '\u{2021}'),
+    (0x83, '\u{2026}'),
+    (0x84, '\u{2014}'),
+    (0x85, '\u{2013}'),
+    (0x86, '\u{192}'),
+    (0x87, '\u{2044}'),
+    (0x88, '\u{2039}'),
+    (0x89, '\u{203A}'),
+    (0x8A, '\u{2212}'),
+    (0x8B, '\u{2030}'),
+    (0x8C, '\u{201E}'),
+    (0x8D, '\u{201C}'),
+    (0x8E, '\u{201D}'),
+    (0x8F, '\u{2018}'),
+    (0x90, '\u{2019}'),
+    (0x91, '\u{201A}'),
+    (0x92, '\u{2122}'),
+    (0x93, '\u{FB01}'),
+    (0x94, '\u{FB02}'),
+    (0x95, '\u{141}'),
+    (0x96, '\u{152}'),
+    (0x97, '\u{160}'),
+    (0x98, '\u{178}'),
+    (0x99, '\u{17D}'),
+    (0x9A, '\u{131}'),
+    (0x9B, '\u{142}'),
+    (0x9C, '\u{153}'),
+    (0x9D, '\u{161}'),
+    (0x9E, '\u{17E}'),
+];
+
+/// A PDF text string (7.9.2.2) as a string: UTF-16BE with a byte-order mark (the specification), UTF-16LE with one and UTF-8 (seen in files
+/// and in PDF 2.0), else PDFDocEncoding. Control characters are dropped, the text is cut to `limit` characters and trimmed.
+pub(crate) fn text_string(bytes: &[u8], limit: usize) -> String {
     let text = if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = body.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect();
         String::from_utf16_lossy(&units)
     } else if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let units: Vec<u16> = body.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         String::from_utf16_lossy(&units)
+    } else if let Some(body) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(body).into_owned()
     } else if let Ok(utf8) = std::str::from_utf8(bytes) {
         utf8.to_string()
     } else {
-        bytes.iter().map(|&b| char::from(b)).collect()
+        bytes
+            .iter()
+            .map(|&b| {
+                if let Some(&(_, c)) = PDF_DOC.iter().find(|(code, _)| *code == b) {
+                    c
+                } else if b == 0xA0 {
+                    '\u{20AC}'
+                } else {
+                    char::from(b)
+                }
+            })
+            .collect()
     };
     text.chars()
         .filter(|c| !c.is_control())
-        .take(300)
+        .take(limit)
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// A text of the PDF's information as a string (see [`text_string`]), at most 300 characters.
+fn pdf_text(bytes: &[u8]) -> String {
+    text_string(bytes, 300)
 }
 
 fn paper(width_pt: f32, height_pt: f32) -> String {
@@ -213,4 +279,26 @@ fn draw(data: Vec<u8>, number: usize) -> Result<(RgbaImage, usize), DecodeError>
     RgbaImage::from_raw(w, h, pixmap.data_as_u8_slice().to_vec())
         .map(|image| (image, count))
         .ok_or_else(|| unreadable("the page was not drawn"))
+}
+
+#[cfg(test)]
+mod text_string_tests {
+    use super::text_string;
+
+    #[test]
+    fn a_text_string_is_read_in_the_encodings_the_specification_names() {
+        // UTF-16BE with a byte-order mark
+        assert_eq!(text_string(&[0xFE, 0xFF, 0x04, 0x13, 0x04, 0x3B], 100), "Гл");
+        // PDFDocEncoding: ASCII, and the codes that are not Latin-1 (a bullet, an en dash, an ellipsis, the Euro sign, a small z with caron)
+        assert_eq!(text_string(b"Plain text", 100), "Plain text");
+        assert_eq!(
+            text_string(&[0x80, b' ', 0x85, b' ', 0x83, b' ', 0xA0, b' ', 0x9E], 100),
+            "\u{2022} \u{2013} \u{2026} \u{20AC} \u{17E}"
+        );
+        // the codes that are the same as Latin-1 stay so (an e with an acute accent)
+        assert_eq!(text_string(&[b'e', 0xE9], 100), "e\u{e9}");
+        // a string is cut, trimmed, and has no control characters
+        assert_eq!(text_string(b"  a\x01b  ", 100), "ab");
+        assert_eq!(text_string(b"abcdef", 3), "abc");
+    }
 }

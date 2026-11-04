@@ -5,3 +5,8 @@ text.pdf  written by hand (a python script of the author's session): a page of 2
 scan.pdf  made by Pillow 11 from a picture: one JPEG on the page, the left half blue and the right half yellow.
 three-pages.pdf  written by hand (a python script of the author's session): three pages of 200 x 100 points, a red one, a green one and a
           blue one, each with the words "Page 1" ... "Page 3" in Helvetica.
+
+outline.pdf  written by hand (a python script of the author's session, 4 November 2026): three pages of 200 x 100 points with no content and an outline of
+          four items: "Chapter 1" (a direct destination) with a child "Section 1.1" (a go-to action to a name in the name tree), a title in UTF-16BE
+          (Russian) with a destination that is a name in the catalogue's `/Dests` dictionary, and a title in PDFDocEncoding (a bullet, the code 0x80) whose
+          action is a remote go-to. `core/src/pdf_outline.rs` reads it. No licence question.
