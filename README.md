@@ -123,6 +123,21 @@ variable before starting Far:
 
 There is no settings dialog yet; if you want to turn something off, say which.
 
+## Turn off "ClearType friendly redraw"
+
+In Far: F9 › Options › Interface settings, clear "ClearType friendly redraw", then Shift+F9 to save the settings.
+(In `far:config` it is `Interface.ClearType`.)
+
+Why. With this option on, Far redraws a whole row of the screen whenever anything in the row changes. When you move the cursor in a
+panel, the rows of the cursor bar are redrawn across the whole screen, the terminal erases the part of the picture that lies on them,
+and stripes cross the picture until it is drawn again. With the option off, Far redraws only what changed and leaves the picture
+alone; a dialog opened over the picture leaves it whole round the dialog too.
+
+Far's source says the option is meant against thin stripes that ClearType font smoothing left in the classic Windows console. The
+plugin does not work in the classic console (it needs a terminal that draws Sixel, such as Windows Terminal 1.22 or newer), and
+Windows Terminal draws the text itself: with the plugin, the option does nothing useful. While it is on, the plugin shows a short
+hint in the quick view and in its box (F11 › Peekel: formats).
+
 ## Working with the macro on Esc
 
 To draw a picture the right size, the plugin asks Windows Terminal for the size of a character cell in pixels and for the colour of the panels (the picture is laid on that colour, so no strip of another colour shows round it). The terminal answers with sequences that begin with Esc. Windows Terminal always reports the same cell size, 10 x 20, whatever the font is, while the real size depends on the font and the scale of the screen (for example Consolas at 150 % is 13 x 28). So the plugin works the real size out itself, from the window of the terminal, with the data of Windows.

@@ -26,6 +26,11 @@ const PICTURES: [&str; 8] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", 
 /// written sooner, Far's own painting of the quick view comes after it and leaves the file's text around the picture.
 const HOLD: Duration = Duration::from_millis(150);
 
+/// The least wait before a picture is written, and how long the panel's cells must stay as they are for Far to count as done
+/// painting (see `show_when_ready`).
+const HOLD_LEAST: Duration = Duration::from_millis(80);
+const QUIET: Duration = Duration::from_millis(40);
+
 /// How long after a dialog or menu came or went the picture is written again.
 const REDRAW: Duration = Duration::from_millis(100);
 
@@ -65,7 +70,7 @@ struct SmallRect {
 
 /// A cell of the console's screen: the character and the colours (the low four bits of the high byte are the background).
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct CharInfo {
     ch: u16,
     attributes: u16,
@@ -128,9 +133,47 @@ struct State {
     hidden_dialog: Option<isize>,
     /// The progress on the taskbar button is on (a picture is being made and it takes long).
     progress: bool,
+    /// The cells of the panel's inside at the last look while the picture waits, and when they last changed.
+    quiet: Option<(Vec<CharInfo>, Instant)>,
+    /// The picture that is on the screen now: it stays while the next one is made, and rows of it that Far paints over are
+    /// written again (see `repair`).
+    shown: Option<Shown>,
+    /// A window of synchronized output is open (see `key_seen`).
+    sync: Option<SyncWindow>,
+    /// A new picture whose Sixel waits after its clearing (see `stage_step`).
+    staged: Option<Staged>,
+    /// The hint about "ClearType friendly redraw" stands under a picture in this place, and when its cells were last looked at
+    /// (see `hint_after_picture`, `hint_step`).
+    hint_looked: Option<Instant>,
+    hint_at: Option<(Rect, usize)>,
+    /// A measurement: the rows repaired at the end of a window are repaired again at these times (see `echo_step`).
+    echo: Vec<(Instant, Vec<(usize, usize)>)>,
 }
 
+/// A picture on the screen: what it is made of, where it stands (row and column from 1, in cells) and the rows of the console
+/// (from the picture's first row, the whole width of the panels) as they were at the last look.
+struct Shown {
+    picture: Arc<Rendered>,
+    row: usize,
+    col: usize,
+    rows: usize,
+    /// The width of the rows looked at (the columns from the screen's left edge to the panel's right edge).
+    width: usize,
+    seen: Option<Vec<CharInfo>>,
+}
+
+/// The newest request that the worker could not make a picture for (a file that does not decode): the picture on the screen is
+/// wiped then.
+static FAILED: AtomicU64 = AtomicU64::new(0);
+
 static STATE: Mutex<State> = Mutex::new(State {
+    sync: None,
+    staged: None,
+    hint_looked: None,
+    hint_at: None,
+    echo: Vec::new(),
+    shown: None,
+    quiet: None,
     target: None,
     written: None,
     settled: false,
@@ -501,7 +544,131 @@ fn forget_card() {
     }
 }
 
+/// Far's "ClearType friendly redraw" (`Interface.ClearType`), as read once: 0 not read yet, 1 off, 2 on, 3 could not be read. With
+/// it on, Far writes a row of the screen whole when any cell of it changed, and a picture in the quick view is cut by the rows
+/// of the list's cursor bar (found on a capture of what Far writes, 4 November 2026).
+static CLEAR_TYPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the picture is wiped round a dialog or menu that comes over the quick view. With "ClearType friendly redraw" on, Far
+/// paints the dialog's rows across the whole screen and a torn picture would be left on both sides of it; with it off, Far paints
+/// only the dialog's own box (seen on a capture of F10's box, 4 November 2026), so the picture stays round it and its part under
+/// the dialog is written again when the dialog goes. `PEEKEL_OFF=hide` never wipes.
+fn wipe_round_dialogs() -> bool {
+    !off("hide") && clear_type_on() != Some(false)
+}
+
+/// Whether Far's "ClearType friendly redraw" is on; None when it could not be read (no LuaMacro). Read once, then kept.
+pub fn clear_type_on() -> Option<bool> {
+    match CLEAR_TYPE.load(Ordering::SeqCst) {
+        0 => read_clear_type(),
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Reads Far's "ClearType friendly redraw" again (it may have been changed since) and keeps it.
+pub fn read_clear_type() -> Option<bool> {
+    let read = api::far_config_bool("Interface", "ClearType");
+    let new = read.map_or(3, |on| if on { 2 } else { 1 });
+    if CLEAR_TYPE.swap(new, Ordering::SeqCst) != new {
+        log::line(&format!("Far's ClearType friendly redraw: {read:?}"));
+    }
+    read
+}
+
+/// How often the option is read again while the plugin runs, so that the hint goes soon after the option is turned off.
+const CLEAR_TYPE_AGAIN: Duration = Duration::from_secs(10);
+static CLEAR_TYPE_READ: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How often the hint's cells are looked at, to write it again when Far has painted over it.
+const HINT_LOOK: Duration = Duration::from_millis(200);
+
+/// The hint's place: the row above the last of the quick view's inside (row, first column, width, as the screen counts from 1) and
+/// its text, when there is room for it below the picture.
+fn hint_place(rect: Rect, picture_end: usize) -> Option<(usize, usize, usize, &'static str)> {
+    let (cols, rows) = inside(rect)?;
+    let row = usize::try_from(rect.top).ok()? + rows;
+    if picture_end >= row {
+        return None;
+    }
+    let text = [crate::formats::CLEAR_TYPE_HINT, crate::formats::CLEAR_TYPE_HINT_SHORT]
+        .into_iter()
+        .find(|t| t.chars().count() + 2 <= cols)?;
+    let width = text.chars().count();
+    let col = usize::try_from(rect.left).ok()? + 2 + (cols - width) / 2;
+    Some((row, col, width, text))
+}
+
+/// Writes `text` (or blanks as wide as the hint, with None) at the hint's place, in the panel's colours.
+fn write_hint(row: usize, col: usize, width: usize, text: Option<&str>) {
+    let sgr = api::panel_colour()
+        .as_ref()
+        .map_or_else(|| "\x1b[0m".to_string(), api::FarColor::sgr);
+    let shown = text.map_or_else(|| " ".repeat(width), str::to_string);
+    let _ = write_console(&format!("\x1b7{sgr}\x1b[{row};{col}H{shown}\x1b[0m\x1b8"));
+}
+
+/// Writes the hint about "ClearType friendly redraw" under a picture just written, while the option is on (see the README, "Turn
+/// off ClearType friendly redraw"); a picture that leaves no row under it gets none.
+fn hint_after_picture(state: &mut State, rect: Rect, picture_end: usize) {
+    state.hint_at = None;
+    if off("hint") || clear_type_on() != Some(true) {
+        return;
+    }
+    let Some((row, col, width, text)) = hint_place(rect, picture_end) else {
+        return;
+    };
+    state.hint_at = Some((rect, picture_end));
+    state.hint_looked = Some(Instant::now());
+    write_hint(row, col, width, Some(text));
+}
+
+/// While the hint is shown: it goes when the option was turned off, and it is written again when Far has painted over it (with the
+/// option on, Far writes whole rows of the screen, the hint's among them).
+fn hint_step(state: &mut State) {
+    let Some((rect, picture_end)) = state.hint_at else {
+        return;
+    };
+    let Some((row, col, width, text)) = hint_place(rect, picture_end) else {
+        state.hint_at = None;
+        return;
+    };
+    if clear_type_on() != Some(true) {
+        state.hint_at = None;
+        write_hint(row, col, width, None);
+        return log::line("the hint goes: ClearType friendly redraw is off now");
+    }
+    if state.hint_looked.is_some_and(|at| at.elapsed() < HINT_LOOK)
+        || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS)
+    {
+        return;
+    }
+    state.hint_looked = Some(Instant::now());
+    let Some(cells) = read_cells(col - 1, row - 1, width, 1) else {
+        return;
+    };
+    let there: String = cells
+        .iter()
+        .map(|c| char::from_u32(u32::from(c.ch)).unwrap_or(' '))
+        .collect();
+    if there != text {
+        write_hint(row, col, width, Some(text));
+    }
+}
+
 pub fn tick() {
+    // the option is read at the first tick and again every `CLEAR_TYPE_AGAIN`
+    let due = CLEAR_TYPE_READ.lock().is_ok_and(|mut at| {
+        let due = at.is_none_or(|t| t.elapsed() >= CLEAR_TYPE_AGAIN);
+        if due {
+            *at = Some(Instant::now());
+        }
+        due
+    });
+    if due {
+        let _ = read_clear_type();
+    }
     if off("tick") {
         return;
     }
@@ -595,8 +762,10 @@ pub fn tick() {
     }
     if state.hide_at.is_some_and(|at| Instant::now() >= at) {
         state.hide_at = None;
-        if !off("hide") {
+        if wipe_round_dialogs() {
             hide_round_dialog(&state);
+        } else if !off("hide") {
+            patch_round_dialog(&state);
         }
         if state.hide_again {
             state.hide_again = false;
@@ -604,6 +773,12 @@ pub fn tick() {
         }
     }
     show_when_ready(&mut state);
+    stage_step(&mut state);
+    late_painting(&mut state);
+    echo_step(&mut state);
+    hint_step(&mut state);
+    sync_step(&mut state, false);
+    repair(&mut state);
     // a picture that takes long (a big photo, a PDF) shows progress of no known length on the taskbar button; it goes when the
     // picture is made, or no longer wanted, or the cursor has left
     let waiting = !off("progress")
@@ -621,7 +796,7 @@ pub fn tick() {
 /// round the dialog's box at once, so that Far paints the dialog on a blank panel and no torn picture is ever on the screen.
 /// Done once for a dialog. The menus are not dialogs; the look at the screen in `hide_round_dialog` catches those.
 pub fn dialog_drawn(dialog: isize) {
-    if off("hide") {
+    if !wipe_round_dialogs() {
         return;
     }
     let Ok(mut state) = STATE.lock() else {
@@ -682,6 +857,12 @@ fn dialog_box(backgrounds: &[u8], cols: usize, panel: u8) -> Option<(usize, usiz
 /// The background colour (0..16) of each cell of a rectangle of the screen (`left` and `top` from 0), row after row, as Far has
 /// it in the console's own buffer: the pictures are not in it, only what Far wrote.
 fn read_backgrounds(left: usize, top: usize, cols: usize, rows: usize) -> Option<Vec<u8>> {
+    let cells = read_cells(left, top, cols, rows)?;
+    Some(cells.iter().map(|c| ((c.attributes >> 4) & 15) as u8).collect())
+}
+
+/// The cells (character and colours) of a rectangle of the screen, row after row, as the console's own buffer has them.
+fn read_cells(left: usize, top: usize, cols: usize, rows: usize) -> Option<Vec<CharInfo>> {
     use std::os::windows::io::AsRawHandle;
     let console = std::fs::OpenOptions::new()
         .read(true)
@@ -707,7 +888,447 @@ fn read_backgrounds(left: usize, top: usize, cols: usize, rows: usize) -> Option
             &raw mut region,
         )
     };
-    (read != 0).then(|| cells.iter().map(|c| ((c.attributes >> 4) & 15) as u8).collect())
+    (read != 0).then_some(cells)
+}
+
+/// Whether the cells of the panel's inside have stayed as they are for `QUIET`: Far paints with the cells it changes, and the
+/// console's buffer has them. Looked at each tick while a picture waits; a failed look counts as not quiet.
+fn far_is_quiet(state: &mut State) -> bool {
+    let Some(target) = state.target.as_ref() else {
+        return false;
+    };
+    let rect = target.rect();
+    let Some((cols, rows)) = inside(rect) else {
+        return false;
+    };
+    let (Ok(left), Ok(top)) = (usize::try_from(rect.left + 1), usize::try_from(rect.top + 1)) else {
+        return false;
+    };
+    let Some(now) = read_cells(left, top, cols, rows) else {
+        return false;
+    };
+    match state.quiet.as_mut() {
+        Some((before, since)) if *before == now => since.elapsed() >= QUIET,
+        _ => {
+            state.quiet = Some((now, Instant::now()));
+            false
+        }
+    }
+}
+
+/// The rows of the console that the picture stands on, the whole width from the screen's left edge to the panel's right edge
+/// (`PEEKEL_OFF=repair` turns the repair off).
+fn look(row: usize, rows: usize, width: usize) -> Option<Vec<CharInfo>> {
+    read_cells(0, row.checked_sub(1)?, width, rows)
+}
+
+/// The Sixel of the rows `runs` (first, last; counted from the picture's first row) of a picture on the screen, each at its place,
+/// from the picture's own pixels (a few kilobytes, not the whole picture).
+fn slices(shown: &Shown, runs: &[(usize, usize)]) -> String {
+    let picture = &shown.picture;
+    let per_row = picture.height / shown.rows.max(1);
+    let mut out = String::from("\x1b7");
+    for &(first, last) in runs {
+        out += &format!("\x1b[{};{}H", shown.row + first, shown.col);
+        out += &sixel::encode_indexed(
+            &picture.index,
+            &picture.palette,
+            picture.width,
+            first * per_row,
+            (last - first + 1) * per_row,
+            0,
+        );
+    }
+    out + "\x1b8"
+}
+
+/// The rows of `dirty` that are set, as runs of (first, last).
+fn runs_of(dirty: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (r, _) in dirty.iter().enumerate().filter(|(_, d)| **d) {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == r => *last = r,
+            _ => runs.push((r, r)),
+        }
+    }
+    runs
+}
+
+/// The rows that differ between two looks (`look`), `width` cells to a row.
+fn rows_changed(before: &[CharInfo], now: &[CharInfo], width: usize, rows: usize) -> Vec<bool> {
+    (0..rows)
+        .map(|r| before[r * width..(r + 1) * width] != now[r * width..(r + 1) * width])
+        .collect()
+}
+
+/// Far painted a row of the screen, and the terminal drops the part of a Sixel picture that is under the cells written to (seen
+/// as a stripe of two rows across the picture, on the rows of the cursor bar of the list; the recordings of 4 November 2026).
+/// ConPTY writes a whole row to the terminal when any cell of it changed (seen on a capture of what Far writes in a ConPTY), so the
+/// row is cut across the whole width. Each tick the rows the picture stands on are read from the console's buffer, and the rows
+/// that changed since the last look are written again from the picture's own pixels. An experiment, off unless `PEEKEL_REPAIR`
+/// is set: ConPTY draws a row some milliseconds after Far wrote it, and a repair that comes sooner is cut again.
+fn repair(state: &mut State) {
+    if std::env::var_os("PEEKEL_REPAIR").is_none() || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS) {
+        return;
+    }
+    let Some(shown) = state.shown.as_mut() else {
+        return;
+    };
+    let Some(now) = look(shown.row, shown.rows, shown.width) else {
+        return;
+    };
+    let Some(before) = shown.seen.replace(now.clone()) else {
+        return;
+    };
+    let runs = runs_of(&rows_changed(&before, &now, shown.width, shown.rows));
+    if runs.is_empty() {
+        return;
+    }
+    let out = slices(shown, &runs);
+    match write_console(&out) {
+        Ok(()) => log::line(&format!(
+            "Far painted rows {runs:?} of the picture's place: written again, {} bytes",
+            out.len()
+        )),
+        Err(e) => note(format!("cannot write: {e}")),
+    }
+}
+
+/// Begins and ends the synchronized output of the terminal (DEC mode 2026, Windows Terminal 1.23 and newer): what is written
+/// between the two is shown at once when the second comes, not piece by piece.
+const BEGIN_SYNC: &str = "\x1b[?2026h";
+const END_SYNC: &str = "\x1b[?2026l";
+/// The longest a synchronized window is held open (Windows Terminal shows what it holds when a window lasts much more than 50 ms),
+/// and how long the panel's rows must stay as they are, after Far began painting, for the window to end.
+const SYNC_MAX: Duration = Duration::from_millis(45);
+const SYNC_QUIET: Duration = Duration::from_millis(20);
+const SYNC_LEAST: Duration = Duration::from_millis(25);
+
+/// How long after the clearing of a new picture's place the picture is written (see `show_when_ready`, `stage_step`).
+const STAGE: Duration = Duration::from_millis(30);
+
+/// A new picture whose clearing is written and whose Sixel waits, inside a window of synchronized output.
+struct Staged {
+    at: Instant,
+    generation: u64,
+    picture: Arc<Rendered>,
+    clearing: String,
+    row: usize,
+    col: usize,
+    rows: usize,
+    width: usize,
+}
+
+/// Writes the Sixel of a staged picture when `STAGE` has passed since its clearing, and ends the window; drops it (and ends the
+/// window) when the cursor has gone to another file meanwhile.
+fn stage_step(state: &mut State) {
+    let Some(staged) = state.staged.as_ref() else {
+        return;
+    };
+    let current = staged.generation == GENERATION.load(Ordering::SeqCst);
+    let over_a_dialog = state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS);
+    if !current || over_a_dialog {
+        state.staged = None;
+        let _ = write_console(END_SYNC);
+        return;
+    }
+    if staged.at.elapsed() < STAGE {
+        return;
+    }
+    let Some(staged) = state.staged.take() else {
+        return;
+    };
+    let sixel = format!("\x1b7\x1b[{};{}H{}\x1b8", staged.row, staged.col, staged.picture.stream);
+    match write_console(&format!("{sixel}{END_SYNC}")) {
+        Ok(()) => {
+            log::line(&format!(
+                "{}: the picture is written, {} bytes, {:?} after the cursor moved",
+                staged.generation,
+                sixel.len(),
+                state.began.map(|at| at.elapsed())
+            ));
+            state.written = Some((format!("\x1b7{}\x1b8{sixel}", staged.clearing), Instant::now()));
+            state.shown = Some(Shown {
+                seen: look(staged.row, staged.rows, staged.width),
+                picture: staged.picture,
+                row: staged.row,
+                col: staged.col,
+                rows: staged.rows,
+                width: staged.width,
+            });
+        }
+        Err(e) => note(format!("cannot write: {e}")),
+    }
+}
+
+/// A window of synchronized output that began with a key that may move the cursor.
+struct SyncWindow {
+    began: Instant,
+    last_change: Instant,
+    /// The rows of the picture that Far painted since the window began.
+    dirty: Vec<bool>,
+    prev: Option<Vec<CharInfo>>,
+}
+
+/// The keys that may take the cursor to another file: PgUp, PgDn, End, Home, Left, Up, Right, Down.
+fn moves_cursor(virtual_key: u16) -> bool {
+    (0x21..=0x28).contains(&virtual_key)
+}
+
+/// Every input record, before Far has it: a key that may move the cursor while a picture is shown opens a window of synchronized
+/// output, so that what Far and ConPTY write to the terminal for the rows of the picture (and our repair of them) is not seen piece
+/// by piece, and no stripe is seen across the picture. `sync_step` ends the window. An experiment, off unless `PEEKEL_SYNC` is set.
+pub fn key_seen(record: &api::InputRecord) {
+    if std::env::var_os("PEEKEL_SYNC").is_none()
+        || record.event_type != api::KEY_EVENT
+        || record.key_down == 0
+        || !moves_cursor(record.virtual_key)
+    {
+        return;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return;
+    };
+    if state.sync.is_some() || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS) {
+        return;
+    }
+    let Some(shown) = state.shown.as_ref() else {
+        return;
+    };
+    let rows = shown.rows;
+    // the rows as they are before Far handles the key: Far paints at once, and a look at the next tick would see them painted
+    let before = look(shown.row, shown.rows, shown.width);
+    if write_console(BEGIN_SYNC).is_ok() {
+        let now = Instant::now();
+        state.sync = Some(SyncWindow {
+            began: now,
+            last_change: now,
+            dirty: vec![false; rows],
+            prev: before,
+        });
+        log::line("a key that may move the cursor: the synchronized window begins");
+    }
+}
+
+/// Writes the repairs of `PEEKEL_ECHO` that are due (on the picture that is shown; a new picture drops them).
+fn echo_step(state: &mut State) {
+    if state.echo.is_empty() {
+        return;
+    }
+    if state.staged.is_some() || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS) {
+        state.echo.clear();
+        return;
+    }
+    let Some(shown) = state.shown.as_ref() else {
+        state.echo.clear();
+        return;
+    };
+    let now = Instant::now();
+    let (due, later): (Vec<_>, Vec<_>) = state.echo.drain(..).partition(|(at, _)| *at <= now);
+    for (_, runs) in due {
+        match write_console(&slices(shown, &runs)) {
+            Ok(()) => log::line(&format!("echo: rows {runs:?} written again")),
+            Err(e) => note(format!("cannot write: {e}")),
+        }
+    }
+    state.echo = later;
+}
+
+/// Far painted rows of the picture's place with no key of ours before it (late: after the file's viewer had read it, or on a timer):
+/// a window of synchronized output is opened at once, with those rows as dirty, so that `sync_step` writes them again when
+/// ConPTY has had its say. Only in synchronized mode (`PEEKEL_SYNC`).
+fn late_painting(state: &mut State) {
+    if std::env::var_os("PEEKEL_SYNC").is_none()
+        || state.sync.is_some()
+        || state.staged.is_some()
+        || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS)
+    {
+        return;
+    }
+    let Some(shown) = state.shown.as_mut() else {
+        return;
+    };
+    let Some(now) = look(shown.row, shown.rows, shown.width) else {
+        return;
+    };
+    let Some(before) = shown.seen.as_ref() else {
+        shown.seen = Some(now);
+        return;
+    };
+    let changed = rows_changed(before, &now, shown.width, shown.rows);
+    if !changed.iter().any(|c| *c) {
+        return;
+    }
+    if write_console(BEGIN_SYNC).is_ok() {
+        let at = Instant::now();
+        log::line(&format!(
+            "Far painted rows {:?} of the picture's place with no key before: the synchronized window begins",
+            runs_of(&changed)
+        ));
+        state.sync = Some(SyncWindow {
+            began: at,
+            last_change: at,
+            dirty: changed,
+            prev: Some(now),
+        });
+    }
+}
+
+/// Ends the window of synchronized output: when it has been quiet (Far painted nothing in the picture's rows for `SYNC_QUIET`, and
+/// at least `SYNC_LEAST` have passed), or the longest time is over, the rows that Far painted are written again and the window
+/// ends, so that the terminal shows the picture whole. A new picture written meanwhile ends it too (`show_when_ready`).
+fn sync_step(state: &mut State, now_or_never: bool) {
+    let Some(mut sync) = state.sync.take() else {
+        return;
+    };
+    let over_a_dialog = state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS);
+    let Some(shown) = state.shown.as_mut() else {
+        // the picture is gone (wiped): nothing to keep whole
+        let _ = write_console(END_SYNC);
+        return;
+    };
+    if over_a_dialog {
+        let _ = write_console(END_SYNC);
+        return;
+    }
+    if let Some(now) = look(shown.row, shown.rows, shown.width) {
+        if let Some(prev) = sync.prev.as_ref() {
+            let changed = rows_changed(prev, &now, shown.width, shown.rows);
+            if changed.iter().any(|c| *c) {
+                sync.last_change = Instant::now();
+                for (d, c) in sync.dirty.iter_mut().zip(&changed) {
+                    *d |= *c;
+                }
+            }
+        }
+        sync.prev = Some(now);
+    }
+    let elapsed = sync.began.elapsed();
+    let quiet = sync.last_change.elapsed() >= SYNC_QUIET && elapsed >= SYNC_LEAST;
+    if !now_or_never && !quiet && elapsed < SYNC_MAX {
+        state.sync = Some(sync);
+        return;
+    }
+    let runs = runs_of(&sync.dirty);
+    // a measurement (`PEEKEL_ECHO`): the same rows are written again 100 and 250 ms later, to see on a recording whether a stripe
+    // that the first repair did not take away goes then (ConPTY's rows came after the repair) or never (the repair is elsewhere)
+    // (`PEEKEL_ECHO=every`: every 20 ms for 400 ms)
+    if let Some(echo) = std::env::var_os("PEEKEL_ECHO")
+        && !runs.is_empty()
+    {
+        let at = Instant::now();
+        let delays: Vec<u64> = if echo == "every" {
+            (1..=20).map(|i| i * 20).collect()
+        } else {
+            vec![100, 250]
+        };
+        state.echo = delays
+            .into_iter()
+            .map(|ms| (at + Duration::from_millis(ms), runs.clone()))
+            .collect();
+    }
+    let Some(shown) = state.shown.as_mut() else {
+        return;
+    };
+    let mut out = if runs.is_empty() {
+        String::new()
+    } else {
+        slices(shown, &runs)
+    };
+    out += END_SYNC;
+    shown.seen = sync.prev.take();
+    match write_console(&out) {
+        Ok(()) => log::line(&format!(
+            "the synchronized window ends after {elapsed:?}: rows {runs:?} written again, {} bytes",
+            out.len()
+        )),
+        Err(e) => note(format!("cannot write: {e}")),
+    }
+}
+
+/// The Sixel of a part of a picture: `cols` x `rows` cells from the cell (`x`, `y`) of the picture (cells of `cw` x `ch` pixels).
+fn crop(picture: &Rendered, x: usize, y: usize, cols: usize, rows: usize, cw: usize, ch: usize) -> String {
+    let (px, py, pw, ph) = (x * cw, y * ch, cols * cw, rows * ch);
+    if px + pw > picture.width || py + ph > picture.height || pw == 0 || ph == 0 {
+        return String::new();
+    }
+    let mut index = Vec::with_capacity(pw * ph);
+    for row in py..py + ph {
+        index.extend_from_slice(&picture.index[row * picture.width + px..row * picture.width + px + pw]);
+    }
+    sixel::encode_indexed(&index, &picture.palette, pw, 0, ph, 0)
+}
+
+/// A dialog or menu is over the picture and "ClearType friendly redraw" is off: the picture stays round it, but Far paints the
+/// cells of the dialog's box that its shadow leaves out (the top right and the bottom left corners) in the panel's colour, and a
+/// picture under them is gone there. Those cells (the panel's colour inside the box of the dialog and its shadow, over the
+/// picture) are written again from the picture's pixels.
+fn patch_round_dialog(state: &State) {
+    let (Some(target), Some(shown)) = (state.target.as_ref(), state.shown.as_ref()) else {
+        return;
+    };
+    let rect = target.rect();
+    let Some((cols, rows)) = inside(rect) else {
+        return;
+    };
+    let Some(panel) = api::panel_colour().and_then(|c| u8::try_from(c.background_index()?).ok()) else {
+        return;
+    };
+    let (Ok(left), Ok(top)) = (usize::try_from(rect.left + 1), usize::try_from(rect.top + 1)) else {
+        return;
+    };
+    let Some(backgrounds) = read_backgrounds(left, top, cols, rows) else {
+        return;
+    };
+    let Some((box_row, box_col, box_rows, box_cols)) = dialog_box(&backgrounds, cols, panel) else {
+        return;
+    };
+    let (cw, ch) = cell();
+    let pic_cols = shown.picture.width / cw.max(1);
+    let mut out = String::new();
+    for r in box_row..box_row + box_rows {
+        // the screen's row and column (from 1) of the grid's cell (r, c) are top + 1 + r and left + 1 + c
+        let screen_row = top + 1 + r;
+        if screen_row < shown.row || screen_row >= shown.row + shown.rows {
+            continue;
+        }
+        let mut c = box_col;
+        while c < box_col + box_cols {
+            if backgrounds[r * cols + c] != panel {
+                c += 1;
+                continue;
+            }
+            let start = c;
+            while c < box_col + box_cols && backgrounds[r * cols + c] == panel {
+                c += 1;
+            }
+            // the run of the panel's colour, cut to the picture's columns
+            let (first, last) = (left + 1 + start, left + 1 + c);
+            let (from, to) = (first.max(shown.col), last.min(shown.col + pic_cols));
+            if from < to {
+                out += &format!("\x1b[{screen_row};{from}H");
+                out += &crop(
+                    &shown.picture,
+                    from - shown.col,
+                    screen_row - shown.row,
+                    to - from,
+                    1,
+                    cw,
+                    ch,
+                );
+            }
+        }
+    }
+    if out.is_empty() {
+        return;
+    }
+    match write_console(&format!("\x1b7{out}\x1b8")) {
+        Ok(()) => log::line(&format!(
+            "the picture's cells round the dialog's shadow written again, {} bytes",
+            out.len()
+        )),
+        Err(e) => note(format!("cannot write: {e}")),
+    }
 }
 
 /// A dialog or menu is over the panels, and Far has painted its rows of the quick view, which left a torn picture (a band
@@ -754,14 +1375,24 @@ fn begin(state: &mut State, want: Target) {
         return note("the panel is too small".into());
     };
     let colour = api::panel_colour();
-    if let Err(e) = write_console(&erase(want.rect(), colour.as_ref(), None)) {
-        note(format!("cannot wipe: {e}"));
+    // The picture that is on the screen stays, in the same place, until the new one comes (the panel was blank for 150 ms and
+    // more between two pictures); the rows of it that Far paints over are written again (`repair`). It is wiped at once when
+    // the panel is another place, or with `PEEKEL_OFF=keep`.
+    let same_place = state.target.as_ref().is_some_and(|t| t.rect == want.rect);
+    if !(same_place && state.shown.is_some() && !off("keep")) {
+        state.shown = None;
+        if let Err(e) = write_console(&erase(want.rect(), colour.as_ref(), None)) {
+            note(format!("cannot wipe: {e}"));
+        }
     }
+    state.quiet = None;
     let background = want.background;
     // the room in the pixels of the real cell, when that is another shape than the one the terminal tells: the terminal stretches
     // a Sixel picture over real cells
     let cell = crate::cell::real().unwrap_or_else(cell);
-    let room = (cols * cell.0, rows * cell.1);
+    // one column less than the inside: Far writes into the inside's first column when the kind of file shown changes (seen on a capture,
+    // 4 November 2026), which would cut a column of a picture that begins there
+    let room = (cols.saturating_sub(1) * cell.0, rows * cell.1);
     let wanted = key_of(&want.path, room, background, want.info);
     let hit = CACHE.lock().ok().and_then(|mut cache| cache.get(&wanted));
     // the files next to the cursor, nearest first: the next one is the likeliest to be wanted
@@ -880,7 +1511,10 @@ fn work(generation: u64, wanted: Option<Key>, neighbours: &[Key], background: [u
                 }
             }
             Ok(_) => {}
-            Err(e) if current() => log::line(&format!("{generation}: cannot make it: {e}")),
+            Err(e) if current() => {
+                FAILED.store(generation, Ordering::SeqCst);
+                log::line(&format!("{generation}: cannot make it: {e}"));
+            }
             Err(_) => {}
         }
     }
@@ -969,6 +1603,8 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
         stream,
         width: picture.width,
         height: picture.height,
+        index: indexed.index,
+        palette: indexed.palette,
     });
     if let Ok(mut cache) = CACHE.lock() {
         cache.insert(key.clone(), Arc::clone(&made));
@@ -981,7 +1617,18 @@ fn show_when_ready(state: &mut State) {
     let Some(target) = state.target.clone() else {
         return;
     };
-    let held = state.began.is_some_and(|at| at.elapsed() < HOLD);
+    // Far paints the quick view some time after the cursor moved, and a picture written before that is cut by the painting.
+    // `HOLD` is the longest wait. Sooner, the picture is written when Far has painted nothing in the panel for `QUIET`
+    // (the cells of the console's buffer did not change) and at least `HOLD_LEAST` have passed. `PEEKEL_OFF=quiet` waits `HOLD`.
+    let waited = state.began.map(|at| at.elapsed());
+    let held = waited.is_some_and(|w| {
+        if off("quiet") {
+            w < HOLD
+        } else {
+            let quiet = far_is_quiet(state);
+            w < HOLD_LEAST || (w < HOLD && !quiet)
+        }
+    });
     let ready = if held {
         None
     } else {
@@ -998,10 +1645,55 @@ fn show_when_ready(state: &mut State) {
         let pic_cols = made.picture.width.div_ceil(cw);
         let pic_rows = made.picture.height.div_ceil(ch);
         let row = usize::try_from(target.rect().top).unwrap_or(0) + 2 + rows.saturating_sub(pic_rows) / 2;
-        let col = usize::try_from(target.rect().left).unwrap_or(0) + 2 + cols.saturating_sub(pic_cols) / 2;
-        // save the cursor; clear what is around the picture; go to its corner, draw, put the cursor back
+        // (centred in the inside less its first column, see `begin`)
+        let col =
+            usize::try_from(target.rect().left).unwrap_or(0) + 3 + cols.saturating_sub(1).saturating_sub(pic_cols) / 2;
+        // a measurement (`PEEKEL_ONE`): only the first picture is written, and it stays while the cursor moves, so that what Far
+        // and ConPTY do to it, and what the repairs do, can be seen with no new picture covering it
+        if std::env::var_os("PEEKEL_ONE").is_some() && state.shown.is_some() {
+            return;
+        }
+        if std::env::var_os("PEEKEL_SYNC").is_some() {
+            // what changes cells goes first, and the picture a little later, inside one window of synchronized output: ConPTY
+            // writes the rows whose cells changed some milliseconds after our write, and the picture written together with the
+            // clearing would be cut by the rows that come after it (seen on a capture: the clearing's rows came after the Sixel)
+            let clearing = erase(
+                target.rect(),
+                api::panel_colour().as_ref(),
+                Some((row, col, pic_rows, pic_cols)),
+            );
+            // Windows Terminal shows what it holds when a window lasts much more than 50 ms (seen with a test of windows of 50 to
+            // 1000 ms, 4 November 2026), so the key's window ends now and the new picture has a short window of its own
+            if state.sync.is_some() {
+                sync_step(state, true);
+            }
+            match write_console(&format!("{BEGIN_SYNC}\x1b7{clearing}\x1b8")) {
+                Ok(()) => {
+                    let width = usize::try_from(target.rect().right).unwrap_or(0) + 1;
+                    state.staged = Some(Staged {
+                        at: Instant::now(),
+                        generation: made.generation,
+                        picture: made.picture.clone(),
+                        clearing,
+                        row,
+                        col,
+                        rows: pic_rows,
+                        width,
+                    });
+                    log::line(&format!(
+                        "{}: the clearing is written, the picture follows in {STAGE:?}",
+                        made.generation
+                    ));
+                }
+                Err(e) => note(format!("cannot write: {e}")),
+            }
+            return;
+        }
+        // save the cursor; clear what is around the picture; go to its corner, draw, put the cursor back; a window of
+        // synchronized output that a key opened ends with the new picture (it covers what Far painted)
+        let sync_ends = if state.sync.take().is_some() { END_SYNC } else { "" };
         let bytes = format!(
-            "\x1b7{}\x1b[{row};{col}H{}\x1b8",
+            "\x1b7{}\x1b[{row};{col}H{}\x1b8{sync_ends}",
             erase(
                 target.rect(),
                 api::panel_colour().as_ref(),
@@ -1021,12 +1713,38 @@ fn show_when_ready(state: &mut State) {
                     made.picture.width,
                     made.picture.height
                 ));
+                log::line(&format!(
+                    "{}: written {:?} after the cursor moved",
+                    made.generation,
+                    state.began.map(|at| at.elapsed())
+                ));
                 state.written = Some((bytes, Instant::now()));
+                // what Far has on these rows now is the first look for `repair`
+                let width = usize::try_from(target.rect().right).unwrap_or(0) + 1;
+                state.shown = Some(Shown {
+                    seen: look(row, pic_rows, width),
+                    picture: made.picture.clone(),
+                    row,
+                    col,
+                    rows: pic_rows,
+                    width,
+                });
+                hint_after_picture(state, target.rect(), row + pic_rows - 1);
             }
             Err(e) => note(format!("cannot write: {e}")),
         }
+    } else if state.written.is_none()
+        && state.shown.is_some()
+        && FAILED.load(Ordering::SeqCst) == GENERATION.load(Ordering::SeqCst)
+    {
+        // no picture for this file: the one on the screen must not stay for another file
+        state.shown = None;
+        if let Err(e) = write_console(&erase(target.rect(), api::panel_colour().as_ref(), None)) {
+            note(format!("cannot wipe: {e}"));
+        }
     } else if !state.settled
         && !off("settle")
+        && std::env::var_os("PEEKEL_SYNC").is_none()
         && !state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS)
         && let Some((bytes, at)) = &state.written
         && at.elapsed() >= SETTLE
@@ -1058,6 +1776,8 @@ fn release() {
         return;
     };
     state.written = None;
+    state.shown = None;
+    state.hint_at = None;
     GENERATION.fetch_add(1, Ordering::SeqCst);
     if off("wipe") {
         return;

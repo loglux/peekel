@@ -132,6 +132,14 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// The lines added to the box while Far's "ClearType friendly redraw" is on (see the README, "Turn off ClearType friendly redraw").
+pub const CLEAR_TYPE_NOTE: &str = "Far's \"ClearType friendly redraw\" is on: pictures get stripes.\n\
+Turn it off: F9 › Options › Interface settings, then Shift+F9 to save.";
+
+/// The hint in the quick view while that option is on, the long one and the one for a narrow panel.
+pub const CLEAR_TYPE_HINT: &str = "Stripes? F9 › Options › Interface: ClearType off";
+pub const CLEAR_TYPE_HINT_SHORT: &str = "Stripes? ClearType off: F9";
+
 /// The box: a title line, then lines (Far's message box takes them as one string, split at the new lines).
 pub fn text(codecs: Option<&[Codec]>, version: &str) -> String {
     let mut out = vec![format!("Peekel {version}: formats"), String::new()];

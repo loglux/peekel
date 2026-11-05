@@ -1,0 +1,5 @@
+# The C runtime is linked into the program and the plugin, so that they need no Visual C++ Redistributable: a Windows without it
+# (Windows Sandbox, a fresh install) did not start a viewer built without this (0xC0000135, VCRUNTIME140.dll not found).
+# docs/development.md "The C runtime is linked in".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

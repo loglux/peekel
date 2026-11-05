@@ -37,6 +37,7 @@ static TEXT: AtomicUsize = AtomicUsize::new(0);
 static VIEWER_CONTROL: AtomicUsize = AtomicUsize::new(0);
 static SEND_DLG_MESSAGE: AtomicUsize = AtomicUsize::new(0);
 static MESSAGE: AtomicUsize = AtomicUsize::new(0);
+static MACRO_CONTROL: AtomicUsize = AtomicUsize::new(0);
 /// The GUIDs of the item of the plugin in Far's plugins menu (F11) and of the box it shows (made up).
 static MENU_GUID: [u8; 16] = *b"\x53\x49\x58\x56\x49\x45\x57\x01\xa1\xb2\xc3\xd4\xe5\xf6\x07\x19";
 static BOX_GUID: [u8; 16] = *b"\x53\x49\x58\x56\x49\x45\x57\x02\xa1\xb2\xc3\xd4\xe5\xf6\x07\x1a";
@@ -91,6 +92,7 @@ pub unsafe extern "system" fn SetStartupInfoW(info: *const PluginStartupInfo) {
     VIEWER_CONTROL.store(info.viewer_control, Ordering::SeqCst);
     SEND_DLG_MESSAGE.store(info.send_dlg_message, Ordering::SeqCst);
     MESSAGE.store(info.message, Ordering::SeqCst);
+    MACRO_CONTROL.store(info.macro_control(), Ordering::SeqCst);
     // the decoders of this Windows are listed in a thread of their own (a moment)
     wic::start();
     // nothing that can panic runs outside a guard in a call from Far: a panic must not unwind into it
@@ -131,7 +133,13 @@ pub unsafe extern "system" fn OpenW(info: *const api::OpenInfo) -> *mut c_void {
     let info = unsafe { &*info };
     if info.open_from == api::OPEN_PLUGINSMENU {
         guarded("the formats box", || {
-            api::message(&BOX_GUID, &formats::text(wic::codecs(), env!("CARGO_PKG_VERSION")));
+            let mut text = formats::text(wic::codecs(), env!("CARGO_PKG_VERSION"));
+            // the setting is read again: it may have been changed since Far started
+            if draw::read_clear_type() == Some(true) {
+                text += "\n\n";
+                text += formats::CLEAR_TYPE_NOTE;
+            }
+            api::message(&BOX_GUID, &text);
         });
     }
     std::ptr::null_mut()
@@ -180,6 +188,7 @@ pub unsafe extern "system" fn ProcessConsoleInputW(info: *const ProcessConsoleIn
     let info = unsafe { &*info };
     let mut taken = false;
     guarded("the input", || {
+        draw::key_seen(&info.record);
         taken = draw::takes_info_key(&info.record) || draw::takes_store_key(&info.record) || cell::takes(&info.record)
     });
     isize::from(taken)

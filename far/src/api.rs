@@ -113,6 +113,107 @@ pub struct PluginStartupInfo {
     pub send_dlg_message: usize,
     def_dlg_proc: usize,
     pub viewer_control: usize,
+    plugins_control: usize,
+    file_filter_control: usize,
+    reg_exp_control: usize,
+    macro_control: usize,
+    settings_control: usize,
+}
+
+type MacroControlFn = unsafe extern "system" fn(*const [u8; 16], i32, isize, *mut c_void) -> isize;
+const MCTL_EXECSTRING: i32 = 10;
+const FMVT_INTEGER: i32 = 1;
+const FMVT_DOUBLE: i32 = 3;
+const FMVT_BOOLEAN: i32 = 4;
+
+#[repr(C)]
+struct MacroExecuteString {
+    struct_size: usize,
+    flags: u64,
+    sequence_text: *const u16,
+    in_count: usize,
+    in_values: *const FarMacroValue,
+    out_count: usize,
+    out_values: *const FarMacroValue,
+}
+
+#[repr(C)]
+struct FarMacroValue {
+    kind: i32,
+    // the union of Far's value: a number, a double, a pointer, or two words (binary, array)
+    value: u64,
+    rest: u64,
+}
+
+/// A yes or no among Far's own settings (`far:config`), read by running `Far.Cfg_Get(key, name)` as a macro: plugins have no
+/// call that reads them, and LuaMacro has this one. None when there is no LuaMacro or the macro gives nothing that is a number
+/// or a yes or no. Only reads.
+pub fn far_config_bool(key: &str, name: &str) -> Option<bool> {
+    let f = crate::MACRO_CONTROL.load(Ordering::SeqCst);
+    if f == 0 {
+        return None;
+    }
+    // SAFETY: the address Far gave in `SetStartupInfoW`, a function of this signature.
+    let f = unsafe { std::mem::transmute::<usize, MacroControlFn>(f) };
+    let text: Vec<u16> = format!("return Far.Cfg_Get(\"{key}\", \"{name}\")")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut run = MacroExecuteString {
+        struct_size: size_of::<MacroExecuteString>(),
+        flags: 0,
+        sequence_text: text.as_ptr(),
+        in_count: 0,
+        in_values: std::ptr::null(),
+        out_count: 0,
+        out_values: std::ptr::null(),
+    };
+    // SAFETY: MCTL_EXECSTRING takes a MacroExecuteString whose text lives through the call; Far fills the results.
+    let done = unsafe { f(&GUID, MCTL_EXECSTRING, 0, (&raw mut run).cast()) };
+    if done == 0 || run.out_count == 0 || run.out_values.is_null() {
+        return None;
+    }
+    // SAFETY: Far says there are `out_count` values there, valid until the next macro call.
+    let first = unsafe { &*run.out_values };
+    match first.kind {
+        FMVT_INTEGER | FMVT_BOOLEAN => Some(first.value != 0),
+        FMVT_DOUBLE => Some(f64::from_bits(first.value) != 0.0),
+        // Far.Cfg_Get gives the value as text (seen: a string), "true" or "false" for a yes or no
+        FMVT_STRING if first.value != 0 => {
+            // SAFETY: a string value is a pointer to a text Far ended with a zero, valid until the next macro call.
+            let text = unsafe { wide_text(first.value as *const u16) };
+            match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+const FMVT_STRING: i32 = 2;
+
+/// A text Far gave as a pointer to UTF-16 ended with a zero (at most 4096 units are looked at).
+///
+/// # Safety
+/// `p` points to such a text.
+unsafe fn wide_text(p: *const u16) -> String {
+    let mut n = 0;
+    // SAFETY: the text ends with a zero, which stops the count before the limit for any text Far gives here.
+    while n < 4096 && unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    // SAFETY: `n` units were read just above.
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
+}
+
+impl PluginStartupInfo {
+    /// `MacroControl`, when the structure Far gave is long enough to have it.
+    pub fn macro_control(&self) -> usize {
+        let end = std::mem::offset_of!(PluginStartupInfo, macro_control) + size_of::<usize>();
+        if self.struct_size >= end { self.macro_control } else { 0 }
+    }
 }
 
 /// `OPEN_PLUGINSMENU` of `OPENFROM`: the plugin was chosen in the plugins menu (F11).

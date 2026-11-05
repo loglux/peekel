@@ -26,6 +26,17 @@ pub struct Rendered {
     pub stream: String,
     pub width: usize,
     pub height: usize,
+    /// The picture as palette indexes (`width` to a row) and its palette: a few rows of it can be written again when Far paints
+    /// over them (`draw::repair`).
+    pub index: Vec<u8>,
+    pub palette: Vec<u32>,
+}
+
+impl Rendered {
+    /// What the picture takes in memory (the stream and the indexes).
+    fn size(&self) -> usize {
+        self.stream.len() + self.index.len()
+    }
 }
 
 /// The most recently used pictures, as many as fit in `limit` bytes of Sixel (the last one stays whatever its size).
@@ -61,13 +72,13 @@ impl Cache {
         if let Some(at) = self.entries.iter().position(|(k, _)| *k == key)
             && let Some((_, old)) = self.entries.remove(at)
         {
-            self.bytes -= old.stream.len();
+            self.bytes -= old.size();
         }
-        self.bytes += picture.stream.len();
+        self.bytes += picture.size();
         self.entries.push_front((key, picture));
         while self.bytes > self.limit && self.entries.len() > 1 {
             if let Some((_, gone)) = self.entries.pop_back() {
-                self.bytes -= gone.stream.len();
+                self.bytes -= gone.size();
             }
         }
     }
@@ -93,6 +104,8 @@ mod tests {
             stream: "x".repeat(bytes),
             width: 10,
             height: 10,
+            index: Vec::new(),
+            palette: Vec::new(),
         })
     }
 
