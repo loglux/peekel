@@ -43,6 +43,13 @@ const HIDE: Duration = Duration::from_millis(150);
 unsafe extern "system" {
     fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
     fn SetConsoleMode(handle: isize, mode: u32) -> i32;
+    fn WriteConsoleW(
+        handle: isize,
+        buffer: *const u16,
+        length: u32,
+        written: *mut u32,
+        reserved: *mut std::ffi::c_void,
+    ) -> i32;
     fn ReadConsoleOutputW(
         handle: isize,
         buffer: *mut CharInfo,
@@ -1549,7 +1556,7 @@ fn squeeze(image: image::RgbaImage) -> image::RgbaImage {
         side(image.width(), told_w, real_w),
         side(image.height(), told_h, real_h),
     );
-    image::imageops::resize(&image, w, h, image::imageops::FilterType::Triangle)
+    peekel_core::resize::triangle(&image, w, h)
 }
 
 /// The picture of `key`, from the cache or made now (and kept). `current` says whether anyone still wants it.
@@ -1834,7 +1841,34 @@ pub fn write_console(bytes: &str) -> Result<(), String> {
         .open("CONOUT$")
         .map_err(|e| e.to_string())?;
     vt_on(&console);
-    console.write_all(bytes.as_bytes()).map_err(|e| e.to_string())
+    if bytes.is_ascii() {
+        return console.write_all(bytes.as_bytes()).map_err(|e| e.to_string());
+    }
+    // bytes written to the console are read in its code page, which need not be UTF-8 (437 on a PC of the author's: the hint's
+    // "›" came out as "ÔÇ║"); text that is not ASCII goes as UTF-16
+    use std::os::windows::io::AsRawHandle;
+    let handle = console.as_raw_handle() as isize;
+    let wide: Vec<u16> = bytes.encode_utf16().collect();
+    let mut at = 0;
+    while at < wide.len() {
+        let part = &wide[at..];
+        let mut written = 0u32;
+        // SAFETY: a console handle, a buffer of `part.len()` units and a place for the count.
+        let ok = unsafe {
+            WriteConsoleW(
+                handle,
+                part.as_ptr(),
+                u32::try_from(part.len()).unwrap_or(u32::MAX),
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || written == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        at += written as usize;
+    }
+    Ok(())
 }
 
 /// Makes sure the console reads escape sequences in what is written to it; the log says if it had to be switched on.

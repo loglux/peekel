@@ -29,6 +29,7 @@ pub mod photo;
 pub mod pptx;
 pub mod quantize;
 pub mod raw;
+pub mod resize;
 pub mod sixel;
 pub mod svg;
 pub mod text;

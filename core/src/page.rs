@@ -301,7 +301,7 @@ impl Page {
                 if w > 8192.0 || h > 8192.0 {
                     continue;
                 }
-                let scaled = imageops::resize(&**image, w as u32, h as u32, imageops::FilterType::Triangle);
+                let scaled = crate::resize::triangle(image, w as u32, h as u32);
                 // what is clear in the picture lets the white of the page through
                 let (ox, oy) = ((x * scale).round() as i64, (y * scale).round() as i64);
                 imageops::overlay(&mut canvas, &scaled, ox, oy);

@@ -55,6 +55,12 @@ impl Parser {
 
     /// The next byte; an event when it completes one.
     pub fn push(&mut self, byte: u8) -> Option<Event> {
+        // an ESC begins a new sequence (outside a string, where `ESC \` ends it): what was half read is a key of its own. Escape
+        // pressed while the program was busy, then the terminal's answer, would else be read as `ESC ESC` and keys `[`, `0`, `n`
+        if byte == ESC && !self.pending.is_empty() && !self.pending.starts_with(&[ESC, b']']) {
+            let before = std::mem::replace(&mut self.pending, vec![ESC]);
+            return Some(Event::Key(before));
+        }
         match self.pending.as_slice() {
             [] if byte != ESC => Some(Event::Key(vec![byte])),
             [] => {
@@ -381,6 +387,22 @@ mod tests {
         assert_eq!(parser.flush(), Some(Event::Key(vec![ESC])));
         assert!(!parser.has_pending());
         assert_eq!(parser.flush(), None, "nothing left to hand over");
+    }
+
+    #[test]
+    fn an_escape_then_the_terminals_answer_at_once_are_the_key_and_the_answer() {
+        // Escape pressed while the viewer was drawing, and the answer to "are you done?" right behind it
+        assert_eq!(
+            parse(b"\x1b\x1b[0nq"),
+            [Event::Key(vec![ESC]), Event::StatusReport, Event::Key(b"q".to_vec())]
+        );
+        // an arrow cut short by another sequence: the piece is a key, the next sequence is whole
+        assert_eq!(
+            parse(b"\x1b[1\x1b[A"),
+            [Event::Key(b"\x1b[1".to_vec()), Event::Key(b"\x1b[A".to_vec())]
+        );
+        // inside a string, ESC \ still ends it
+        assert_eq!(parse(b"\x1b]11;rgb:00/00/00\x1b\\"), [Event::Background([0, 0, 0])]);
     }
 
     #[test]

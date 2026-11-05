@@ -9,7 +9,6 @@ use std::fmt;
 use std::path::Path;
 
 use crate::guard::unreadable;
-use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 
 /// More pixels than this are refused before they are decoded: 100 megapixels is 400 MB.
@@ -259,7 +258,7 @@ pub fn fit(img: RgbaImage, max_width: usize, max_height: usize) -> RgbaImage {
     if current.dimensions() == (tw, th) {
         return current;
     }
-    imageops::resize(&current, tw, th, FilterType::Triangle)
+    crate::resize::triangle(&current, tw, th)
 }
 
 /// Half the size: each pixel the mean of a 2 × 2 block, weighted by alpha so a transparent pixel's colour does not

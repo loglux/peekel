@@ -6,7 +6,7 @@
 //! of the window; it is kept so that the window never looks past the picture's edge.
 
 use image::RgbaImage;
-use image::imageops::{self, FilterType};
+use image::imageops;
 
 use crate::decode::{Picture, halve, to_picture};
 
@@ -246,7 +246,7 @@ pub fn side_by_side(pages: &[RgbaImage], equal_height: bool) -> Option<RgbaImage
         if size == page.dimensions() {
             imageops::replace(&mut out, page, x, 0);
         } else {
-            let resized = imageops::resize(page, size.0, size.1, FilterType::Triangle);
+            let resized = crate::resize::triangle(page, size.0, size.1);
             imageops::replace(&mut out, &resized, x, 0);
         }
         x += i64::from(size.0) + i64::from(gap);
@@ -293,7 +293,7 @@ pub fn render(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
     let drawn = if cropped.dimensions() == (out_w, out_h) {
         cropped
     } else {
-        imageops::resize(&cropped, out_w, out_h, FilterType::Triangle)
+        crate::resize::triangle(&cropped, out_w, out_h)
     };
     Some(Frame {
         picture: to_picture(&drawn),
