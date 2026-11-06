@@ -7,7 +7,8 @@
 **Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, a DjVu book, the
 start of a Word, PowerPoint, Excel or OpenDocument file, and a card for fonts, programs and archives.
 
-A console viewer (for F3, Linux and Midnight Commander) works and is being prepared; it will be published a little later.
+A sibling project, [Peekel viewer](https://github.com/loglux/peekel-viewer), is a file viewer for the terminal that also reads PDF and
+DjVu books: put it on F3 in Far or in Midnight Commander, on Windows and Linux.
 
 ## Why
 

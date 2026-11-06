@@ -7,7 +7,8 @@
 **Peekel это плагин быстрого просмотра для Far Manager**: нажмите Ctrl+Q и увидите в панели, что это за файл: картинку, SVG, PDF, книгу DjVu,
 начало файла Word, PowerPoint, Excel или OpenDocument, карточку для шрифтов, программ и архивов.
 
-Консольный просмотрщик (для F3, Linux и Midnight Commander) работает и готовится; он будет выложен чуть позже.
+Соседний проект, [Peekel viewer](https://github.com/loglux/peekel-viewer), — просмотрщик файлов для терминала, который ещё и читает
+книги PDF и DjVu: его можно повесить на F3 в Far или в Midnight Commander, в Windows и в Linux.
 
 ## Почему он
 
