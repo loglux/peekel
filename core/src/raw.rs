@@ -20,7 +20,7 @@ use crate::guard::{has_extension, unreadable};
 
 /// The extensions of the RAW formats whose container is TIFF-like. (Canon's CR3 is another container, ISO BMFF; Fuji's RAF
 /// has a header of its own: neither is read yet.)
-const EXTENSIONS: [&str; 15] = [
+pub(crate) const EXTENSIONS: [&str; 15] = [
     "nef", "nrw", "cr2", "arw", "sr2", "srf", "dng", "orf", "pef", "3fr", "erf", "mef", "kdc", "dcr", "rw2",
 ];
 

@@ -82,7 +82,7 @@ fn mismatch(path: &Path, kind: &str) -> Option<String> {
         return None;
     }
     // the documents of Office and the like are ZIPs: their kind begins with ZIP when the archive was not opened
-    if kind.starts_with("ZIP") && matches!(extension.as_str(), "zip") {
+    if (kind.starts_with("ZIP") || kind.starts_with("FictionBook")) && matches!(extension.as_str(), "zip") {
         return None;
     }
     Some(if kind == "Binary data" {
@@ -106,6 +106,8 @@ fn kind_of(head: &[u8], archive: Option<&Archive<'_>>) -> String {
         "PowerPoint presentation".to_string()
     } else if has("xl/workbook.xml") {
         "Excel workbook".to_string()
+    } else if crate::epub::is_epub_archive(archive) {
+        "EPUB e-book".to_string()
     } else if has("META-INF/manifest.xml") {
         "OpenDocument file".to_string()
     } else if has("AndroidManifest.xml") {
@@ -175,6 +177,16 @@ pub fn of(path: &Path) -> Info {
             .to_ascii_uppercase();
         info.kind = format!("RAW photograph ({extension})");
     }
+    // an FB2 book is XML, or a ZIP with the XML in it: the name says it is a book
+    let is_fb2 = crate::fb2::is_fb2(path)
+        && (head.starts_with(b"PK")
+            || head
+                .iter()
+                .find(|b| !b.is_ascii_whitespace() && !matches!(b, 0xEF | 0xBB | 0xBF | 0xFF | 0xFE | 0))
+                == Some(&b'<'));
+    if is_fb2 {
+        info.kind = "FictionBook e-book (FB2)".to_string();
+    }
 
     push(
         &mut info.rows,
@@ -212,6 +224,12 @@ pub fn of(path: &Path) -> Info {
                 .unwrap_or_default(),
         };
         info.rows.extend(rows);
+    } else if is_fb2 {
+        info.rows.extend(crate::fb2::properties(path));
+    } else if info.kind == "EPUB e-book" {
+        if let Some(archive) = &archive {
+            info.rows.extend(crate::epub::properties(archive));
+        }
     } else if info.kind == "PDF document" {
         if let Some(bytes) = whole {
             info.rows.extend(crate::pdf::properties(bytes));

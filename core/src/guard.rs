@@ -4,8 +4,6 @@
 
 use std::path::Path;
 
-use image::RgbaImage;
-
 use crate::decode::DecodeError;
 
 /// The stack of the thread a drawing runs on (a table inside a table inside ... as deep as the parser lets).
@@ -32,9 +30,10 @@ pub fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>, DecodeError> {
 }
 
 /// Runs `work` on a thread called `name` with a large stack; a panic of it is the error `failure`.
-pub fn draw_on_thread<F>(name: &str, failure: &str, work: F) -> Result<RgbaImage, DecodeError>
+pub fn draw_on_thread<T, F>(name: &str, failure: &str, work: F) -> Result<T, DecodeError>
 where
-    F: FnOnce() -> Result<RgbaImage, DecodeError> + Send,
+    T: Send,
+    F: FnOnce() -> Result<T, DecodeError> + Send,
 {
     std::thread::scope(|scope| {
         std::thread::Builder::new()

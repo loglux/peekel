@@ -182,20 +182,24 @@ pub use peekel_djvu::text::{Rect, normalise};
 /// no zones, or when the picture is not the size of the page's `INFO` (a turned page, a page drawn smaller: the zones are counted in the
 /// page's own pixels, and a picture that is another shape than the page is not guessed at).
 pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage) -> Result<usize, DecodeError> {
-    let Some((rects, (width, height))) = find_on_page(path, page, needle)? else {
-        return Ok(0);
-    };
+    Ok(find_on_page(path, page, needle)?.map_or(0, |found| paint_found(&found, image)))
+}
+
+/// Marks the rectangles found (counted in a page of the size given) on `image`, the picture of that page at any scale; how many. Used for
+/// the words of a PDF too (`pdf_text`).
+pub(crate) fn paint_found((rects, (width, height)): &Found, image: &mut RgbaImage) -> usize {
+    let (width, height) = (*width, *height);
     if width == 0 || height == 0 || rects.is_empty() {
-        return Ok(0);
+        return 0;
     }
     let (scale_x, scale_y) = (
         f64::from(image.width()) / f64::from(width),
         f64::from(image.height()) / f64::from(height),
     );
     if (scale_x - scale_y).abs() > 0.02 * scale_x {
-        return Ok(0);
+        return 0;
     }
-    for rect in &rects {
+    for rect in rects {
         // one pixel of margin round the word at the picture's scale, so that the print at its edge is covered
         let margin = scale_x.max(1.0);
         let edge = |v: i32, scale: f64, by: f64, limit: u32| ((f64::from(v) * scale + by).max(0.0) as u32).min(limit);
@@ -215,7 +219,7 @@ pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage)
             }
         }
     }
-    Ok(rects.len())
+    rects.len()
 }
 
 /// What a search finds on a page: the rectangles of the words, and the size of the page they are counted in.

@@ -45,6 +45,8 @@ const ESC: u8 = 0x1B;
 #[derive(Debug, Default)]
 pub struct Parser {
     pending: Vec<u8>,
+    /// When the last byte given to [`Parser::push_at`] was read.
+    last: Option<std::time::Instant>,
 }
 
 impl Parser {
@@ -107,6 +109,23 @@ impl Parser {
             Some(rgb) => Event::Background(rgb),
             None => Event::Key(sequence),
         }
+    }
+
+    /// As [`Parser::push`], the byte with the time it was read: when `quiet` or more had passed since the byte before, what was half read
+    /// is handed over first as a key of its own. A terminal sends a sequence (Alt and a key, an arrow) at once, so Escape pressed and
+    /// `q` pressed a second later are two keys even when a busy program reads them together; read only by their bytes they were
+    /// `ESC q`, Alt+Q.
+    pub fn push_at(&mut self, byte: u8, at: std::time::Instant, quiet: std::time::Duration) -> Vec<Event> {
+        let mut events = Vec::new();
+        if self
+            .last
+            .is_some_and(|last| at.saturating_duration_since(last) >= quiet)
+        {
+            events.extend(self.flush());
+        }
+        self.last = Some(at);
+        events.extend(self.push(byte));
+        events
     }
 
     /// A half-read sequence handed over as a key: call it when a short while has passed without another byte.
@@ -403,6 +422,31 @@ mod tests {
         );
         // inside a string, ESC \ still ends it
         assert_eq!(parse(b"\x1b]11;rgb:00/00/00\x1b\\"), [Event::Background([0, 0, 0])]);
+    }
+
+    #[test]
+    fn escape_and_a_key_read_a_second_apart_are_two_keys_and_alt_with_a_key_is_one() {
+        use std::time::{Duration, Instant};
+        let quiet = Duration::from_millis(50);
+        let t = Instant::now();
+        let mut parser = Parser::default();
+        // Escape pressed, then q a second later, read together by a program that was busy
+        let mut got = parser.push_at(ESC, t, quiet);
+        got.extend(parser.push_at(b'q', t + Duration::from_secs(1), quiet));
+        assert_eq!(got, [Event::Key(vec![ESC]), Event::Key(b"q".to_vec())]);
+        // Alt+Q: the terminal sends the two bytes at once
+        let mut parser = Parser::default();
+        let mut got = parser.push_at(ESC, t, quiet);
+        got.extend(parser.push_at(b'q', t + Duration::from_millis(1), quiet));
+        assert_eq!(got, [Event::Key(b"\x1bq".to_vec())]);
+        // an arrow read in pieces close together is still an arrow
+        let mut parser = Parser::default();
+        let got: Vec<Event> = b"\x1b[A"
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &b)| parser.push_at(b, t + Duration::from_millis(i as u64 * 5), quiet))
+            .collect();
+        assert_eq!(got, [Event::Key(b"\x1b[A".to_vec())]);
     }
 
     #[test]

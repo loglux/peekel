@@ -5,10 +5,11 @@
 ![Far Manager: a picture in the quick view, drawn by the Peekel plugin](docs/images/far-quickview-v2.png)
 
 **Peekel is a quick-view plugin for Far Manager**: press Ctrl+Q and see what a file is, in the panel: a picture, SVG, a PDF, a DjVu book, the
-start of a Word, PowerPoint, Excel or OpenDocument file, and a card for fonts, programs and archives.
+first page of an FB2 or EPUB book, the start of a Word, PowerPoint, Excel or OpenDocument file, and a card for fonts, programs and
+archives.
 
-A sibling project, [Peekel viewer](https://github.com/loglux/peekel-viewer), is a file viewer for the terminal that also reads PDF and
-DjVu books: put it on F3 in Far or in Midnight Commander, on Windows and Linux.
+A sibling project, [Peekel viewer](https://github.com/loglux/peekel-viewer), is a file viewer for the terminal that also reads PDF,
+DjVu, FB2 and EPUB books: put it on F3 in Far or in Midnight Commander, on Windows and Linux.
 
 ## Why
 
@@ -71,6 +72,7 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | DjVu (scanned books) | the first page; the card gives the number of pages and the size of the page (read by a reader of our own, written from the format's open specification; not read yet: the text layer and documents whose pages are separate files) |
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
 | OpenDocument: text (.odt), spreadsheet (.ods), presentation (.odp) | the start, the top of the sheet, the first slide |
+| FB2 (also `.fb2.zip`), EPUB (without DRM), HTML | the first page as the book is laid out (the cover when it has one) |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
 | Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |
 
@@ -126,7 +128,7 @@ There is no settings dialog yet; if you want to turn something off, say which.
 
 ## Turn off "ClearType friendly redraw"
 
-In Far: F9 › Options › Interface settings, clear "ClearType friendly redraw", then Shift+F9 to save the settings.
+In Far: F9 › Options › Interface settings, clear "ClearType friendly redraw" and press OK.
 (In `far:config` it is `Interface.ClearType`.)
 
 Why. With this option on, Far redraws a whole row of the screen whenever anything in the row changes. When you move the cursor in a

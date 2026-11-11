@@ -115,12 +115,13 @@ fn hex(colour: Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", colour[0], colour[1], colour[2])
 }
 
-/// A family name made safe to put in an attribute (quotes and markup out), with the fallbacks.
-fn family(name: Option<&str>) -> String {
+/// A family name, or a list of them (`Georgia, Times New Roman, serif`), made safe to put in an attribute (quotes and markup out), with
+/// the fallbacks.
+pub(crate) fn family(name: Option<&str>) -> String {
     let clean: String = name
         .unwrap_or("")
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == ',')
         .collect();
     let clean = clean.trim();
     // each family followed by the free font of its width, for a machine that has not the original (`fontset`)

@@ -65,58 +65,94 @@ pub fn decode(path: &Path, max_width: usize, max_height: usize) -> Result<Pictur
 struct Special {
     is: fn(&Path) -> bool,
     draw: fn(&Path) -> Result<RgbaImage, DecodeError>,
+    /// The endings of the names `is` takes (without the dot), for the masks of file managers (`peekel --masks`); a test
+    /// holds them to `is`.
+    endings: &'static [&'static str],
 }
 
-const SPECIAL: [Special; 12] = [
+const SPECIAL: [Special; 15] = [
     Special {
         is: crate::raw::is_raw,
         draw: crate::raw::render,
+        endings: &crate::raw::EXTENSIONS,
     },
     Special {
         is: crate::dds::is_dds,
         draw: crate::dds::render,
+        endings: &["dds"],
     },
     Special {
         is: crate::jxl::is_jxl,
         draw: crate::jxl::render,
+        endings: &["jxl"],
     },
     Special {
         is: crate::svg::is_svg,
         draw: crate::svg::render,
+        endings: &["svg", "svgz"],
     },
     Special {
         is: crate::pdf::is_pdf,
         draw: crate::pdf::render_first_page,
+        endings: &["pdf"],
     },
     Special {
         is: crate::djvu::is_djvu,
         draw: crate::djvu::render_first_page,
+        endings: &["djvu", "djv"],
+    },
+    Special {
+        is: crate::fb2::is_fb2,
+        draw: crate::fb2::render_first_page,
+        endings: &["fb2", "fb2.zip", "fbz"],
+    },
+    Special {
+        is: crate::epub::is_epub,
+        draw: crate::epub::render_first_page,
+        endings: &["epub"],
+    },
+    Special {
+        is: crate::html::is_html,
+        draw: crate::html::render_first_page,
+        endings: &["html", "htm", "xhtml"],
     },
     Special {
         is: crate::docx::is_docx,
         draw: crate::docx::render_first_page,
+        endings: &["docx"],
     },
     Special {
         is: crate::odt::is_odt,
         draw: crate::odt::render_first_page,
+        endings: &["odt"],
     },
     Special {
         is: crate::ods::is_ods,
         draw: crate::ods::render_first_page,
+        endings: &["ods"],
     },
     Special {
         is: crate::odp::is_odp,
         draw: crate::odp::render_first_page,
+        endings: &["odp"],
     },
     Special {
         is: crate::pptx::is_pptx,
         draw: crate::pptx::render_first_page,
+        endings: &["pptx"],
     },
     Special {
         is: crate::xlsx::is_xlsx,
         draw: crate::xlsx::render_first_page,
+        endings: &["xlsx"],
     },
 ];
+
+/// The endings of the names of the special formats (without the dot, small letters): what [`is_special`] takes, for the masks of
+/// file managers.
+pub fn special_endings() -> impl Iterator<Item = &'static str> {
+    SPECIAL.iter().flat_map(|s| s.endings.iter().copied())
+}
 
 /// Whether the name says a format of its own (SVG, PDF, ...) and not one of the pictures `image` reads.
 pub fn is_special(path: &Path) -> bool {
@@ -150,7 +186,7 @@ pub struct ContentsItem {
     pub page: Option<usize>,
 }
 
-/// The contents of a book (its bookmarks), for a list to jump from: `Some` for a DjVu book or a PDF that has them; `None` for a book with
+/// The contents of a book (its bookmarks), for a list to jump from: `Some` for a DjVu book or a PDF that has them and an FB2 or EPUB book with contents; `None` for a book with
 /// none and for the kinds of file that have no contents.
 pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
     if crate::djvu::is_djvu(path) {
@@ -159,28 +195,96 @@ pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
     if crate::pdf::is_pdf(path) {
         return crate::pdf_outline::contents(path);
     }
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::contents(path);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::contents(path);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::contents(path);
+    }
     Ok(None)
 }
 
-/// The text of each page of a book, for a search: `Some` for a DjVu file that has a text layer (an empty string for a page without
-/// text); `None` for a book with no text layer and for the kinds of file whose text is not read yet (a PDF).
+/// The text of each page of a book, for a search: `Some` for a DjVu file that has a text layer, a PDF that has text, or an FB2 or EPUB
+/// book (an empty string for a page without); `None` for a book with none (a scan) and for any other file.
 pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     if crate::djvu::is_djvu(path) {
         return crate::djvu::page_texts(path);
+    }
+    if crate::pdf::is_pdf(path) {
+        return crate::pdf_text::page_texts(path);
+    }
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::page_texts(path);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::page_texts(path);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::page_texts(path);
     }
     Ok(None)
 }
 
 /// Marks on `image` (page `page` of the file as `decode_page` gave it) the words that `needle` (made by `djvu::normalise`) is in: for a
-/// DjVu book with the zones of its text layer; nothing is marked in any other file. How many words were marked.
+/// DjVu book with the zones of its text layer, a PDF with text and an FB2 or EPUB book; nothing is marked in any other file. How many words were marked.
 pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage) -> Result<usize, DecodeError> {
     if crate::djvu::is_djvu(path) {
         return crate::djvu::mark_words(path, page, needle, image);
     }
+    if crate::pdf::is_pdf(path) {
+        return crate::pdf_text::mark_words(path, page, needle, image);
+    }
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::mark_words(path, page, needle, image);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::mark_words(path, page, needle, image);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::mark_words(path, page, needle, image);
+    }
     Ok(0)
 }
 
-/// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF or a DjVu file has many, anything else one
+/// Whether the file is a book whose text flows (FB2, EPUB, an HTML page): laid out into pages here, at the size of text the reader chose
+/// (`book::set_text_size`).
+pub fn text_flows(path: &Path) -> bool {
+    crate::fb2::is_fb2(path) || crate::epub::is_epub(path) || crate::html::is_html(path)
+}
+
+/// The place of page `page` in the text of a book whose text flows (how many words come before it), which stays when the size of the
+/// text changes; `None` for any other file.
+pub fn place_of(path: &Path, page: usize) -> Result<Option<usize>, DecodeError> {
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::place_of(path, page).map(Some);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::place_of(path, page).map(Some);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::place_of(path, page).map(Some);
+    }
+    Ok(None)
+}
+
+/// The page that place `place` (from [`place_of`]) is on at the size of the text now; `None` for a file whose text does not flow.
+pub fn page_at(path: &Path, place: usize) -> Result<Option<usize>, DecodeError> {
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::page_at(path, place).map(Some);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::page_at(path, place).map(Some);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::page_at(path, place).map(Some);
+    }
+    Ok(None)
+}
+
+/// Page `page` (counted from 0) of the file at `path` and the number of pages it has: a PDF, a DjVu file or an FB2 or EPUB book has many, anything else one
 /// (and `page` is not looked at). A page past the end is the last.
 pub fn decode_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), DecodeError> {
     if crate::pdf::is_pdf(path) {
@@ -188,6 +292,15 @@ pub fn decode_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
     }
     if crate::djvu::is_djvu(path) {
         return crate::djvu::render_page(path, page);
+    }
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::render_page(path, page);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::render_page(path, page);
+    }
+    if crate::html::is_html(path) {
+        return crate::html::render_page(path, page);
     }
     decode_full(path).map(|image| (image, 1))
 }
@@ -355,6 +468,21 @@ pub fn composite_over(argb: &mut [u32], background: [u8; 3]) {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn the_endings_given_for_the_masks_are_those_each_format_takes() {
+        for special in &SPECIAL {
+            assert!(!special.endings.is_empty());
+            for ending in special.endings {
+                assert_eq!(*ending, ending.to_ascii_lowercase());
+                for name in [format!("a.{ending}"), format!("A.{}", ending.to_ascii_uppercase())] {
+                    assert!((special.is)(Path::new(&name)), "{name}");
+                }
+            }
+        }
+        assert!(special_endings().any(|e| e == "fb2.zip"));
+        assert!(special_endings().all(|e| is_special(Path::new(&format!("x.{e}")))));
+    }
 
     #[test]
     fn composite_over_mixes_by_the_alpha_and_leaves_an_opaque_pixel_alone() {

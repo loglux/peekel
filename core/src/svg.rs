@@ -64,7 +64,7 @@ fn installed(db: &usvg::fontdb::Database, candidates: &[&str]) -> Option<String>
 /// The families that stand for "sans serif", "serif" and "monospace" are Arial, Times New Roman and Courier New until
 /// said otherwise, and a machine without them (a Linux one) would draw no text at all: each is set to the first font of
 /// a list that is installed.
-fn fonts() -> Arc<usvg::fontdb::Database> {
+pub(crate) fn fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     FONTS
         .get_or_init(|| {

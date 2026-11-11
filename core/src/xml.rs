@@ -1,7 +1,8 @@
 //! What the document formats (docx, pptx, xlsx) share in reading XML: parsing with limits, and finding things by their local
 //! name (the namespace is not looked at: the prefixes differ from file to file, and the names do not).
 
-use roxmltree::{Document, Node, ParsingOptions};
+use roxmltree::ParsingOptions;
+pub use roxmltree::{Document, Node};
 
 use crate::decode::DecodeError;
 

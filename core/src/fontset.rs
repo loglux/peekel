@@ -10,7 +10,8 @@
 //!   uses it and one that has not uses the free one;
 //! - a folder of the user's own fonts (the originals copied from their Windows or Office), `PEEKEL_FONTS` or the `fonts` line of the
 //!   settings, looked in first;
-//! - the folder of the program's own for fonts it was given (`peekel/fonts` in the user's data folder), then the fonts of the system.
+//! - the folder of the program's own for fonts it was given (`peekel/fonts` in the user's data folder), the folder `fonts` beside the
+//!   program (the Linux archive brings the free ones there), then the fonts of the system.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -80,8 +81,15 @@ pub fn own_dir() -> Option<PathBuf> {
     base.map(|d| d.join("peekel").join("fonts"))
 }
 
+/// The folder `fonts` beside the program: the free fonts the Linux archive brings with it.
+pub fn beside_program() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("fonts")))
+}
+
 /// The folders to read fonts from, the first the most wanted: those of `PEEKEL_FONTS` (a list the way `PATH` is), those the settings gave,
-/// the program's own. Only those that are folders.
+/// the program's own, the one beside the program. Only those that are folders.
 pub fn dirs() -> Vec<PathBuf> {
     let mut all: Vec<PathBuf> = Vec::new();
     if let Some(list) = std::env::var_os("PEEKEL_FONTS") {
@@ -91,6 +99,7 @@ pub fn dirs() -> Vec<PathBuf> {
         all.extend(given.iter().cloned());
     }
     all.extend(own_dir());
+    all.extend(beside_program());
     all.retain(|d| d.is_dir());
     all
 }
@@ -134,5 +143,21 @@ mod tests {
         set_user_dirs(Vec::new());
         assert!(all.contains(&there));
         assert!(!all.contains(&missing));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a test that cannot make its folder should stop at once
+    fn the_folder_fonts_beside_the_program_is_read_when_it_is_there() {
+        let beside = beside_program().expect("the test program has a folder");
+        let made = !beside.exists();
+        if made {
+            std::fs::create_dir(&beside).expect("a folder beside the test program");
+        }
+        let all = dirs();
+        if made {
+            let _ = std::fs::remove_dir(&beside);
+        }
+        assert!(all.contains(&beside), "{beside:?} not in {all:?}");
+        assert_eq!(beside.file_name().and_then(|n| n.to_str()), Some("fonts"));
     }
 }
