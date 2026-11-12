@@ -187,6 +187,12 @@ pub fn of(path: &Path) -> Info {
     if is_fb2 {
         info.kind = "FictionBook e-book (FB2)".to_string();
     }
+    // a torrent is bencode: a dictionary, `d` and a key's length
+    let is_torrent =
+        crate::torrent::is_torrent(path) && head.first() == Some(&b'd') && head.get(1).is_some_and(u8::is_ascii_digit);
+    if is_torrent {
+        info.kind = "BitTorrent file".to_string();
+    }
 
     push(
         &mut info.rows,
@@ -226,6 +232,10 @@ pub fn of(path: &Path) -> Info {
         info.rows.extend(rows);
     } else if is_fb2 {
         info.rows.extend(crate::fb2::properties(path));
+    } else if is_torrent {
+        if let Ok(bytes) = crate::guard::read_limited(path, crate::torrent::MAX_BYTES) {
+            info.rows.extend(crate::torrent::properties(&bytes));
+        }
     } else if info.kind == "EPUB e-book" {
         if let Some(archive) = &archive {
             info.rows.extend(crate::epub::properties(archive));

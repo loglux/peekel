@@ -73,6 +73,7 @@ Far Manager, the quick view (Ctrl+Q) with the plugin. The PDF cover is public do
 | Word (.docx), PowerPoint (.pptx), Excel (.xlsx) | the start, the first slide, the top of the sheet |
 | OpenDocument: text (.odt), spreadsheet (.ods), presentation (.odp) | the start, the top of the sheet, the first slide |
 | FB2 (also `.fb2.zip`), EPUB (without DRM), HTML | the first page as the book is laid out (the cover when it has one) |
+| BitTorrent (.torrent) | a **card**: the name, the size and files, the largest named, who made it and when, the tracker, private or not, the info-hash |
 | Fonts, programs (exe, dll), ZIP, gzip, any other binary file | a **card**: the kind, size, dates; fonts in their own letters, programs with icon, version and company, ZIP with its files |
 | Files inside an archive shown by ArcLite, 7-Zip and the like | the same as for any file |
 
@@ -113,7 +114,8 @@ From source: install Rust (the version is in `rust-toolchain.toml`) and run `car
 
 Press Ctrl+Q in a panel to make the other panel a quick view, and move the cursor: a picture, a document or a card is drawn in
 the frame, over the text Far would print there; text files are shown by Far as usual. **Ctrl+Alt+I** shows the card of the file (kind, size, dates, the EXIF of a photo)
-instead of the picture; press it again to go back. If something is wrong, set an environment
+instead of the picture; press it again to go back. On a `.torrent`, **Ctrl+Alt+M** copies its magnet link to the clipboard. If
+something is wrong, set an environment
 variable before starting Far:
 
 | Variable | Does |

@@ -245,9 +245,13 @@ pub(crate) fn off(part: &str) -> bool {
     std::env::var("PEEKEL_OFF").is_ok_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case(part)))
 }
 
-/// Whether the start of the file has a NUL or many control characters, which text does not.
+/// Whether the start of the file has a NUL or many control characters, which text does not; a `.torrent` counts as binary always
+/// (its start is readable bencode, but its card, not its bytes, is what there is to see).
 fn looks_binary(path: &Path) -> bool {
     use std::io::Read;
+    if peekel_core::torrent::is_torrent(path) {
+        return true;
+    }
     let mut head = [0u8; 4096];
     let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) else {
         return false;
@@ -480,6 +484,42 @@ fn is_info_key(virtual_key: u16, control_keys: u32) -> bool {
 /// Ctrl+Alt+S: the Microsoft Store, for the codec that the file shown lacks.
 fn is_store_key(virtual_key: u16, control_keys: u32) -> bool {
     is_chord(virtual_key, control_keys, b'S')
+}
+
+/// Ctrl+Alt+M: the magnet link of the `.torrent` shown, to the clipboard.
+fn is_magnet_key(virtual_key: u16, control_keys: u32) -> bool {
+    is_chord(virtual_key, control_keys, b'M')
+}
+
+/// Every input record, before Far has it: Ctrl+Alt+M, while the quick view shows a `.torrent`, sends its magnet link to the
+/// terminal's clipboard (OSC 52, as the viewer's `y` and `m` do). True when the record is that key and a torrent is shown (the press
+/// and the release both); otherwise the key is Far's.
+pub fn takes_magnet_key(record: &api::InputRecord) -> bool {
+    if record.event_type != api::KEY_EVENT || !is_magnet_key(record.virtual_key, record.control_keys) {
+        return false;
+    }
+    let Ok(state) = STATE.lock() else {
+        return false;
+    };
+    let Some(path) = state
+        .target
+        .as_ref()
+        .map(|t| t.path.clone())
+        .filter(|p| peekel_core::torrent::is_torrent(p))
+    else {
+        return false;
+    };
+    drop(state);
+    if record.key_down != 0 {
+        match peekel_core::torrent::magnet_of(&path) {
+            Some(link) => {
+                let sent = write_console(&peekel_term::clipboard::copy_sequence(&link));
+                log::line(&format!("Ctrl+Alt+M: the magnet link sent to the clipboard: {sent:?}"));
+            }
+            None => log::line("Ctrl+Alt+M: the torrent could not be read"),
+        }
+    }
+    true
 }
 
 /// Every input record, before Far has it: Ctrl+Alt+S, while the quick view shows a file whose Store codec Windows lacks (its card
@@ -2006,6 +2046,18 @@ mod tests {
             "the card's key is not the Store's"
         );
         assert!(!is_info_key(u16::from(b'S'), ctrl | alt));
+    }
+
+    #[test]
+    fn ctrl_alt_m_is_the_key_for_the_magnet_link_and_nothing_less() {
+        let (ctrl, alt, shift) = (0x8, 0x2, 0x10);
+        assert!(is_magnet_key(u16::from(b'M'), ctrl | alt));
+        assert!(is_magnet_key(u16::from(b'M'), 0x4 | 0x1), "the right Ctrl and Alt too");
+        assert!(!is_magnet_key(u16::from(b'M'), ctrl), "Ctrl+M alone is Far's");
+        assert!(!is_magnet_key(u16::from(b'M'), alt));
+        assert!(!is_magnet_key(u16::from(b'M'), ctrl | alt | shift));
+        assert!(!is_magnet_key(u16::from(b'I'), ctrl | alt));
+        assert!(!is_info_key(u16::from(b'M'), ctrl | alt));
     }
 
     #[test]

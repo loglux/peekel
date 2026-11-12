@@ -189,7 +189,10 @@ pub unsafe extern "system" fn ProcessConsoleInputW(info: *const ProcessConsoleIn
     let mut taken = false;
     guarded("the input", || {
         draw::key_seen(&info.record);
-        taken = draw::takes_info_key(&info.record) || draw::takes_store_key(&info.record) || cell::takes(&info.record)
+        taken = draw::takes_info_key(&info.record)
+            || draw::takes_store_key(&info.record)
+            || draw::takes_magnet_key(&info.record)
+            || cell::takes(&info.record)
     });
     isize::from(taken)
 }
