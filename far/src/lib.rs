@@ -76,11 +76,35 @@ pub unsafe extern "system" fn GetGlobalInfoW(info: *mut GlobalInfo) {
     let info = unsafe { &mut *info };
     info.struct_size = size_of::<GlobalInfo>();
     info.min_far_version = VersionInfo::new(3, 0, 0, 0);
-    info.version = VersionInfo::new(0, 2, 1, 0);
+    info.version = VERSION;
     info.guid = GUID;
     info.title = utf16("Peekel").as_ptr();
-    info.description = utf16("A picture in the quick view panel as Sixel").as_ptr();
-    info.author = utf16("Peekel").as_ptr();
+    info.description = utf16(DESCRIPTION).as_ptr();
+    info.author = utf16(AUTHOR).as_ptr();
+}
+
+/// The version Far shows and PlugRing matches the uploaded archive against: the crate's own (the workspace's), never a
+/// number typed by hand (0.2.1 stayed here from 0.2.1 to 0.8.0).
+const VERSION: VersionInfo = VersionInfo::new(
+    number(env!("CARGO_PKG_VERSION_MAJOR")),
+    number(env!("CARGO_PKG_VERSION_MINOR")),
+    number(env!("CARGO_PKG_VERSION_PATCH")),
+    0,
+);
+const DESCRIPTION: &str =
+    "Quick view (Ctrl+Q) as Sixel graphics: pictures, SVG, PDF, DjVu, FB2, EPUB, Office files, cards";
+const AUTHOR: &str = "Vladislav Sorokin";
+
+/// A part of a version written in decimal digits (Cargo makes sure it is one).
+const fn number(digits: &str) -> u32 {
+    let bytes = digits.as_bytes();
+    let mut n = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        n = n * 10 + (bytes[i] - b'0') as u32;
+        i += 1;
+    }
+    n
 }
 
 #[unsafe(no_mangle)]
@@ -215,5 +239,22 @@ mod tests {
         // later calls do nothing, not even run
         guarded("a test", || unreachable!("the plugin is stopped"));
         BROKEN.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn far_is_told_the_version_of_the_crate() -> Result<(), std::num::ParseIntError> {
+        assert_eq!(number("0"), 0);
+        assert_eq!(number("12"), 12);
+        let mut info: GlobalInfo = unsafe { std::mem::zeroed() };
+        unsafe { GetGlobalInfoW(&mut info) };
+        let crate_version = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .map(str::parse)
+            .collect::<Result<Vec<u32>, _>>()?;
+        assert_eq!(
+            info.version,
+            VersionInfo::new(crate_version[0], crate_version[1], crate_version[2], 0)
+        );
+        Ok(())
     }
 }

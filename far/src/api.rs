@@ -25,7 +25,7 @@ pub const PFLAGS_PLUGIN: u64 = 0x800;
 const FILE_ATTRIBUTE_DIRECTORY: usize = 0x10;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VersionInfo {
     major: u32,
     minor: u32,
