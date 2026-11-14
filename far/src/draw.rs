@@ -149,10 +149,10 @@ struct State {
     sync: Option<SyncWindow>,
     /// A new picture whose Sixel waits after its clearing (see `stage_step`).
     staged: Option<Staged>,
-    /// The hint about "ClearType friendly redraw" stands under a picture in this place, and when its cells were last looked at
-    /// (see `hint_after_picture`, `hint_step`).
+    /// The hint (about "ClearType friendly redraw", or the picture's note) stands under a picture, and when its cells were last
+    /// looked at (see `hint_after_picture`, `hint_step`).
     hint_looked: Option<Instant>,
-    hint_at: Option<(Rect, usize)>,
+    hint_at: Option<Hint>,
     /// A measurement: the rows repaired at the end of a window are repaired again at these times (see `echo_step`).
     echo: Vec<(Instant, Vec<(usize, usize)>)>,
 }
@@ -632,19 +632,35 @@ static CLEAR_TYPE_READ: Mutex<Option<Instant>> = Mutex::new(None);
 const HINT_LOOK: Duration = Duration::from_millis(200);
 
 /// The hint's place: the row above the last of the quick view's inside (row, first column, width, as the screen counts from 1) and
-/// its text, when there is room for it below the picture.
-fn hint_place(rect: Rect, picture_end: usize) -> Option<(usize, usize, usize, &'static str)> {
+/// its text, when there is room for it below the picture. The hint about ClearType while that option is on (it is about every
+/// picture); otherwise the picture's `note` (what the file holds that is not drawn), cut to the width with "…".
+fn hint_place(rect: Rect, picture_end: usize, note: Option<&str>) -> Option<(usize, usize, usize, String)> {
     let (cols, rows) = inside(rect)?;
     let row = usize::try_from(rect.top).ok()? + rows;
     if picture_end >= row {
         return None;
     }
-    let text = [crate::formats::CLEAR_TYPE_HINT, crate::formats::CLEAR_TYPE_HINT_SHORT]
-        .into_iter()
-        .find(|t| t.chars().count() + 2 <= cols)?;
+    let room = cols.checked_sub(2)?;
+    let text = if clear_type_on() == Some(true) {
+        [crate::formats::CLEAR_TYPE_HINT, crate::formats::CLEAR_TYPE_HINT_SHORT]
+            .into_iter()
+            .find(|t| t.chars().count() <= room)?
+            .to_string()
+    } else {
+        cut(note?, room)?
+    };
     let width = text.chars().count();
     let col = usize::try_from(rect.left).ok()? + 2 + (cols - width) / 2;
     Some((row, col, width, text))
+}
+
+/// `text` in at most `room` characters, cut with "…"; None when not even a few fit.
+fn cut(text: &str, room: usize) -> Option<String> {
+    let length = text.chars().count();
+    if length <= room {
+        return Some(text.to_string());
+    }
+    (room >= 8).then(|| text.chars().take(room - 1).chain(std::iter::once('…')).collect())
 }
 
 /// Writes `text` (or blanks as wide as the hint, with None) at the hint's place, in the panel's colours.
@@ -656,36 +672,56 @@ fn write_hint(row: usize, col: usize, width: usize, text: Option<&str>) {
     let _ = write_console(&format!("\x1b7{sgr}\x1b[{row};{col}H{shown}\x1b[0m\x1b8"));
 }
 
-/// Writes the hint about "ClearType friendly redraw" under a picture just written, while the option is on (see the README, "Turn
-/// off ClearType friendly redraw"); a picture that leaves no row under it gets none.
-fn hint_after_picture(state: &mut State, rect: Rect, picture_end: usize) {
+/// Writes the hint under a picture just written ([`hint_place`]): about "ClearType friendly redraw" while the option is on (see the
+/// README, "Turn off ClearType friendly redraw"), or the picture's note; a picture that leaves no row under it gets none.
+fn hint_after_picture(state: &mut State, rect: Rect, picture_end: usize, note: Option<String>) {
     state.hint_at = None;
-    if off("hint") || clear_type_on() != Some(true) {
+    if off("hint") {
         return;
     }
-    let Some((row, col, width, text)) = hint_place(rect, picture_end) else {
+    let Some((row, col, width, text)) = hint_place(rect, picture_end, note.as_deref()) else {
         return;
     };
-    state.hint_at = Some((rect, picture_end));
+    state.hint_at = Some(Hint {
+        rect,
+        picture_end,
+        note,
+        written: (row, col, width, text.clone()),
+    });
     state.hint_looked = Some(Instant::now());
-    write_hint(row, col, width, Some(text));
+    write_hint(row, col, width, Some(&text));
 }
 
-/// While the hint is shown: it goes when the option was turned off, and it is written again when Far has painted over it (with the
-/// option on, Far writes whole rows of the screen, the hint's among them).
+/// While the hint is shown: when what it should say changed (ClearType was turned off, and the note or nothing is said now) the old
+/// one is blanked and the new one written; and it is written again when Far has painted over it (with the option on, Far writes
+/// whole rows of the screen, the hint's among them).
 fn hint_step(state: &mut State) {
-    let Some((rect, picture_end)) = state.hint_at else {
+    let Some(hint) = state.hint_at.as_mut() else {
         return;
     };
-    let Some((row, col, width, text)) = hint_place(rect, picture_end) else {
-        state.hint_at = None;
-        return;
-    };
-    if clear_type_on() != Some(true) {
-        state.hint_at = None;
+    let wanted = hint_place(hint.rect, hint.picture_end, hint.note.as_deref());
+    if wanted.as_ref() != Some(&hint.written) {
+        let (row, col, width, _) = hint.written;
         write_hint(row, col, width, None);
-        return log::line("the hint goes: ClearType friendly redraw is off now");
+        match wanted {
+            Some((row, col, width, text)) => {
+                write_hint(row, col, width, Some(&text));
+                hint.written = (row, col, width, text);
+                log::line("the hint changes (ClearType friendly redraw was turned on or off)");
+            }
+            None => {
+                state.hint_at = None;
+                return log::line("the hint goes: ClearType friendly redraw is off now");
+            }
+        }
     }
+    let Some(Hint {
+        written: (row, col, width, text),
+        ..
+    }) = state.hint_at.clone()
+    else {
+        return;
+    };
     if state.hint_looked.is_some_and(|at| at.elapsed() < HINT_LOOK)
         || state.window.is_some_and(|(_, kind)| kind != api::WTYPE_PANELS)
     {
@@ -700,8 +736,17 @@ fn hint_step(state: &mut State) {
         .map(|c| char::from_u32(u32::from(c.ch)).unwrap_or(' '))
         .collect();
     if there != text {
-        write_hint(row, col, width, Some(text));
+        write_hint(row, col, width, Some(&text));
     }
+}
+
+/// The hint under the picture: where the picture is, its note, and what was written where (row, column, width, text).
+#[derive(Clone)]
+struct Hint {
+    rect: Rect,
+    picture_end: usize,
+    note: Option<String>,
+    written: (usize, usize, usize, String),
 }
 
 pub fn tick() {
@@ -1606,8 +1651,8 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     }
     // a file that is no picture, or one that cannot be read as one (a cut PNG, an encrypted PDF), gets a card
     let decoded = if is_picture(&key.path) && !key.info {
-        decode::decode_for_room(&key.path, key.room.0, key.room.1)
-            .or_else(|first| read_by_windows(&key.path, key.room, first))
+        decode::decode_for_room_noted(&key.path, key.room.0, key.room.1)
+            .or_else(|first| read_by_windows(&key.path, key.room, first).map(|image| (image, None)))
             .map_err(|e| {
                 log::line(&format!("{}: {e}: a card instead", key.path.display()));
                 e
@@ -1615,12 +1660,26 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
     } else {
         Err(decode::DecodeError::NoRoom)
     };
-    let image = match decoded {
-        Ok(image) => image,
+    let (image, note) = match decoded {
+        // a picture with a note that fills the room's height is made three rows lower, so that the note has a row under it (the hint's
+        // row is the inside's last but one, and the picture is centred: `hint_place`); only an SVG has a note, and only when something
+        // in it was not drawn
+        Ok((image, Some(note))) => {
+            let row = crate::cell::real().unwrap_or_else(cell).1;
+            let lower = key.room.1.saturating_sub(3 * row);
+            let image = if image.height() as usize + 3 * row > key.room.1 && lower > row {
+                decode::decode_for_room(&key.path, key.room.0, lower).unwrap_or(image)
+            } else {
+                image
+            };
+            (image, Some(note))
+        }
+        Ok(made) => made,
         Err(why) => {
             let note = crate::formats::codec_hint(&key.path, &why.to_string());
-            card::render_with_note(&key.path, key.room.0, key.room.1, background, note.as_deref())
-                .map_err(|e| e.to_string())?
+            let card = card::render_with_note(&key.path, key.room.0, key.room.1, background, note.as_deref())
+                .map_err(|e| e.to_string())?;
+            (card, None)
         }
     };
     if !current() {
@@ -1652,6 +1711,7 @@ fn make(key: &Key, background: [u8; 3], current: &dyn Fn() -> bool) -> Result<Ar
         height: picture.height,
         index: indexed.index,
         palette: indexed.palette,
+        note,
     });
     if let Ok(mut cache) = CACHE.lock() {
         cache.insert(key.clone(), Arc::clone(&made));
@@ -1776,7 +1836,7 @@ fn show_when_ready(state: &mut State) {
                     rows: pic_rows,
                     width,
                 });
-                hint_after_picture(state, target.rect(), row + pic_rows - 1);
+                hint_after_picture(state, target.rect(), row + pic_rows - 1, made.picture.note.clone());
             }
             Err(e) => note(format!("cannot write: {e}")),
         }
@@ -1929,6 +1989,20 @@ fn vt_on(console: &std::fs::File) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_note_under_the_picture_is_cut_to_the_room_and_left_out_where_there_is_almost_none() {
+        let note = "not drawn: 1 linked file, 3 pictures";
+        assert_eq!(cut(note, 60).as_deref(), Some(note));
+        assert_eq!(cut(note, note.chars().count()).as_deref(), Some(note));
+        let short = cut(note, 20).unwrap_or_default();
+        assert_eq!(short.chars().count(), 20);
+        assert!(
+            short.starts_with("not drawn: 1 link") && short.ends_with('…'),
+            "{short}"
+        );
+        assert_eq!(cut(note, 7), None);
+    }
 
     #[test]
     fn a_dialog_is_kept_with_its_shadow_in_screen_cells_from_1() {

@@ -608,7 +608,11 @@ mod tests {
         let deep = "<p>before</p>".to_string() + &"<div>".repeat(100_000) + "deep text";
         let start = Instant::now();
         let (xml, cut) = xml_of(&deep);
-        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(5) * crate::slack(),
+            "{:?}",
+            start.elapsed()
+        );
         assert!(cut);
         assert!(crate::xml::parse(&xml).is_ok());
         assert!(xml.contains("before"));

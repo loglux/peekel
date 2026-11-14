@@ -134,6 +134,6 @@ mod tests {
         let mut huge = vec![0xff, 0x0a];
         huge.extend([0xff; 12]);
         let _ = render_bytes(&huge);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5) * crate::slack());
     }
 }

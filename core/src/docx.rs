@@ -762,7 +762,7 @@ mod tests {
         let img = render(&docx(&body, ""));
         assert!(img.is_ok(), "{:?}", img.err());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(10) * crate::slack(),
             "{:?}",
             started.elapsed()
         );

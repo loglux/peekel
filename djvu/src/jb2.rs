@@ -196,7 +196,7 @@ fn decode_num(zp: &mut ZpDecoder<'_>, ctx: &mut NumContext, low: i64, high: i64)
     let branch = &mut ctx.branches[usize::from(positive)];
     // phase 2: which range of Table 8 (0, 1-2, 3-6, 7-14, ...) holds v
     let mut found = None;
-    for j in 0..=17_usize {
+    for (j, range) in branch.ranges.iter_mut().enumerate() {
         let (lo, hi) = if j == 0 {
             (0, 0)
         } else {
@@ -210,7 +210,7 @@ fn decode_num(zp: &mut ZpDecoder<'_>, ctx: &mut NumContext, low: i64, high: i64)
         } else {
             // spec 11.2.5.2 says a 1 means "v is in this range"; in real streams a 1 means "v is further on" (found by decoding
             // the pages of real books), so a 0 is what says "in this range"
-            !zp.decode_bit(&mut branch.ranges[j])
+            !zp.decode_bit(range)
         };
         if inside {
             found = Some((j, lo, hi));

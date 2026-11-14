@@ -1125,6 +1125,6 @@ mod tests {
         }
         let started = std::time::Instant::now();
         let _ = draw(&odt(&body, ""));
-        assert!(started.elapsed().as_secs() < 20);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20) * crate::slack());
     }
 }

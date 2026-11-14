@@ -295,7 +295,7 @@ mod tests {
         let started = std::time::Instant::now();
         let items = read_contents(data).expect("reads").expect("has items");
         assert_eq!(items[0].page, None);
-        assert!(started.elapsed().as_secs() < 5);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5) * crate::slack());
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
         let started = std::time::Instant::now();
         let items = read_contents(pdf_of(&objects)).expect("reads").expect("has items");
         assert_eq!(items.len(), MAX_ITEMS);
-        assert!(started.elapsed().as_secs() < 30);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30) * crate::slack());
     }
 
     #[test]

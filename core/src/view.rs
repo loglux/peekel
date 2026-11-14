@@ -5,10 +5,13 @@
 //! enlarged (a small picture is shown as it is). The position is the picture's point (in its own pixels) in the middle
 //! of the window; it is kept so that the window never looks past the picture's edge.
 
+use std::sync::Arc;
+
 use image::RgbaImage;
 use image::imageops;
 
 use crate::decode::{Picture, halve, to_picture};
+use crate::svg::Drawing;
 
 /// How much one step of zooming in or out changes the scale.
 pub const ZOOM_STEP: f64 = 1.25;
@@ -164,11 +167,25 @@ impl View {
 #[derive(Debug)]
 pub struct Image {
     levels: Vec<RgbaImage>,
+    /// The SVG the picture was drawn from, when it is one: a part of it shown enlarged is drawn again from its shapes
+    /// ([`render_sharp`]).
+    drawing: Option<Arc<Drawing>>,
 }
 
 impl Image {
     pub fn new(picture: RgbaImage) -> Self {
-        Self { levels: vec![picture] }
+        Self {
+            levels: vec![picture],
+            drawing: None,
+        }
+    }
+
+    /// The picture `drawing` made of itself ([`Drawing::render`]), with the drawing kept for the zoom.
+    pub fn of_drawing(picture: RgbaImage, drawing: Arc<Drawing>) -> Self {
+        Self {
+            levels: vec![picture],
+            drawing: Some(drawing),
+        }
     }
 
     /// A picture of one clear pixel, for a file that is shown as a card and has no picture of its own.
@@ -181,9 +198,12 @@ impl Image {
     }
 
     /// The picture turned clockwise by `quarters` quarter turns (any number; 4 is no turn). The halved copies are dropped: they are
-    /// made again, from the turned picture, when they are wanted.
+    /// made again, from the turned picture, when they are wanted. A drawing turned is enlarged as a picture is (not drawn again).
     #[must_use]
     pub fn turned(mut self, quarters: i32) -> Self {
+        if quarters.rem_euclid(4) == 0 {
+            return self;
+        }
         let Some(first) = self.levels.drain(..).next() else {
             return self;
         };
@@ -260,9 +280,16 @@ pub struct Frame {
     pub picture: Picture,
 }
 
-/// The pixels of the window for `view` in `room`; None when there is no room or no picture.
-pub fn render(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
-    let size = image.size();
+/// Where the window is on a picture of `size`: the scale, the corner and the size of the part it shows (in the picture's pixels), and
+/// the size of that part on the screen.
+struct Place {
+    scale: f64,
+    corner: (f64, f64),
+    visible: (f64, f64),
+    out: (u32, u32),
+}
+
+fn place(size: Size, view: &View, room: Room) -> Option<Place> {
     if room.0 == 0 || room.1 == 0 || size.0 == 0 || size.1 == 0 {
         return None;
     }
@@ -272,6 +299,40 @@ pub fn render(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
     let y = (view.center.1 - visible_h / 2.0).clamp(0.0, f64::from(size.1) - visible_h);
     let out_w = ((visible_w * scale).round() as u32).clamp(1, u32::try_from(room.0).unwrap_or(u32::MAX));
     let out_h = ((visible_h * scale).round() as u32).clamp(1, u32::try_from(room.1).unwrap_or(u32::MAX));
+    Some(Place {
+        scale,
+        corner: (x, y),
+        visible: (visible_w, visible_h),
+        out: (out_w, out_h),
+    })
+}
+
+/// As [`render`], but a picture drawn from an SVG that the window shows enlarged (more than one pixel of the window for each of its
+/// own) has the part shown drawn again from its shapes, at the scale of the window: it stays sharp at any zoom. The same pixels as
+/// [`render`] gives where the picture is not enlarged, and if the drawing fails.
+pub fn render_sharp(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
+    if let Some(drawing) = image.drawing.clone() {
+        let size = image.size();
+        if let Some(place) = place(size, view, room).filter(|p| p.scale > 1.0)
+            && let Ok(drawn) = drawing.render_part(size, place.corner, place.scale, place.out)
+        {
+            return Some(Frame {
+                picture: to_picture(&drawn),
+            });
+        }
+    }
+    render(image, view, room)
+}
+
+/// The pixels of the window for `view` in `room`; None when there is no room or no picture.
+pub fn render(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
+    let size = image.size();
+    let Place {
+        scale,
+        corner: (x, y),
+        visible: (visible_w, visible_h),
+        out: (out_w, out_h),
+    } = place(size, view, room)?;
 
     // from the copy halved as often as keeps the rest of the shrinking within 1/2 and 1: the largest k with
     // scale * 2^k <= 1
@@ -313,6 +374,82 @@ mod tests {
         Image::new(RgbaImage::from_fn(width, height, |x, y| {
             Rgba([(x / per_red).min(255) as u8, (y / per_green).min(255) as u8, 0, 255])
         }))
+    }
+
+    #[test]
+    fn an_svg_enlarged_is_drawn_again_from_its_shapes_and_shown_as_before_where_it_is_not() {
+        // a black line across a white field: enlarged as pixels its edges smear over many rows, drawn again they stay sharp
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="0 0 100 50">
+             <rect width="100" height="50" fill="#ffffff"/>
+             <path d="M0 25.3 L100 25.3" stroke="#000000" stroke-width="0.5"/>
+           </svg>"##;
+        let path = std::env::temp_dir().join(format!("peekel-view-svg-{}.svg", std::process::id()));
+        std::fs::write(&path, svg).expect("writes the file");
+        let drawing = Drawing::open(&path).expect("parses");
+        let _ = std::fs::remove_file(&path);
+        let picture = drawing.render().expect("draws");
+        let mut plain = Image::new(picture.clone());
+        let mut kept = Image::of_drawing(picture, Arc::new(drawing));
+        let size = kept.size();
+        // the whole picture (shrunk): the same pixels either way
+        let whole = View::new(size);
+        assert_eq!(render_sharp(&mut kept, &whole, ROOM), render(&mut plain, &whole, ROOM));
+        // about nine times enlarged (the line, in the middle, is in the window): the same size and place, the edges sharp
+        let mut close = View::new(size);
+        for _ in 0..13 {
+            close.zoom_by(ZOOM_STEP, size, ROOM);
+        }
+        assert!((8.0..10.0).contains(&close.scale(size, ROOM)));
+        let sharp = render_sharp(&mut kept, &close, ROOM).expect("a frame");
+        let soft = render(&mut plain, &close, ROOM).expect("a frame");
+        assert_eq!(
+            (sharp.picture.width, sharp.picture.height),
+            (soft.picture.width, soft.picture.height)
+        );
+        // the rows in the middle column that are neither the white field nor the black of the line: the edges of the line
+        let grey_rows = |frame: &Frame| {
+            let middle = frame.picture.width / 2;
+            frame
+                .picture
+                .argb
+                .chunks(frame.picture.width)
+                .filter(|row| (40..=215).contains(&(row[middle] & 0xff)))
+                .count()
+        };
+        let black_rows = |frame: &Frame| {
+            let middle = frame.picture.width / 2;
+            frame
+                .picture
+                .argb
+                .chunks(frame.picture.width)
+                .filter(|row| row[middle] & 0xff < 40)
+                .count()
+        };
+        let (sharp_edges, soft_edges) = (grey_rows(&sharp), grey_rows(&soft));
+        assert!(
+            black_rows(&sharp) > 20,
+            "the line is there, {} rows",
+            black_rows(&sharp)
+        );
+        assert!(
+            sharp_edges <= 2,
+            "{sharp_edges} rows grey at the edges when drawn again"
+        );
+        assert!(soft_edges >= 8, "{soft_edges} rows grey when enlarged");
+        // a picture with no drawing is enlarged as before; a turned drawing too
+        assert_eq!(render_sharp(&mut plain, &close, ROOM), render(&mut plain, &close, ROOM));
+        let mut turned = kept.turned(1);
+        let turned_view = View::from_relative(close.relative(size, ROOM).expect("zoomed"), turned.size(), ROOM);
+        let mut turned_plain = Image::new(turned_rgba(drawing_picture(&mut plain), 1));
+        assert_eq!(
+            render_sharp(&mut turned, &turned_view, ROOM),
+            render(&mut turned_plain, &turned_view, ROOM)
+        );
+    }
+
+    /// The picture an `Image` holds, as it was made.
+    fn drawing_picture(image: &mut Image) -> RgbaImage {
+        image.level(0).clone()
     }
 
     fn drawn_size(image: &mut Image, view: &View, room: Room) -> (usize, usize) {

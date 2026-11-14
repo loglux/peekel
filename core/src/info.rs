@@ -219,7 +219,29 @@ pub fn of(path: &Path) -> Info {
         // the picture's size is not IFD0's (a thumbnail): it is the sensor's, the biggest directory of the file
         let size = whole.as_deref().and_then(crate::raw::find_preview).and_then(|p| p.size);
         picture(path, &head, size, &mut info.rows);
-    } else if info.kind.contains("image") || info.kind == "SVG drawing" {
+    } else if info.kind == "SVG drawing" {
+        picture(path, &head, None, &mut info.rows);
+        // what the drawing holds that is not drawn, and why
+        if let Ok(drawing) = crate::svg::Drawing::open(path) {
+            let skipped = drawing.skipped();
+            let rows = [
+                (skipped.linked, "a path or an address: never opened"),
+                (
+                    skipped.drawings,
+                    "a drawing inside: refused by the limits, or one level too deep",
+                ),
+                (
+                    skipped.pictures,
+                    "a picture inside: over the limits, or not PNG, JPEG, GIF, WebP",
+                ),
+            ];
+            for (count, why) in rows {
+                if count > 0 {
+                    push(&mut info.rows, "Not drawn", format!("{count} × {why}"));
+                }
+            }
+        }
+    } else if info.kind.contains("image") {
         picture(path, &head, None, &mut info.rows);
     } else if info.kind == "DjVu document" {
         // a book is often bigger than the limit for reading a file whole: the pages are counted from the file itself

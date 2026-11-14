@@ -30,6 +30,8 @@ pub struct Rendered {
     /// over them (`draw::repair`).
     pub index: Vec<u8>,
     pub palette: Vec<u32>,
+    /// What the file holds that is not in the picture (an SVG's linked files...), said under it when there is room.
+    pub note: Option<String>,
 }
 
 impl Rendered {
@@ -106,6 +108,7 @@ mod tests {
             height: 10,
             index: Vec::new(),
             palette: Vec::new(),
+            note: None,
         })
     }
 

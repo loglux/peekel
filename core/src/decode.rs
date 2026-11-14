@@ -161,12 +161,30 @@ pub fn is_special(path: &Path) -> bool {
 
 /// As [`decode_full`], but a DjVu page (a scan of 10 to 20 million pixels) is made at a size not smaller than the box when the box is
 /// at least twice as small, which is far less work than the page whole; the caller shrinks the picture to the box (see [`fit`]).
-/// Any other file is read at its own size.
+/// An SVG is drawn as large as fits in the box, and not drawn large and shrunk. Any other file is read at its own size.
 pub fn decode_for_room(path: &Path, max_width: usize, max_height: usize) -> Result<RgbaImage, DecodeError> {
     if crate::djvu::is_djvu(path) {
         return crate::djvu::render_within(path, max_width, max_height);
     }
+    if crate::svg::is_svg(path) {
+        return crate::svg::render_within(path, max_width, max_height);
+    }
     decode_full(path)
+}
+
+/// As [`decode_for_room`], with a line saying what the file holds that was not drawn, when something was not (an SVG's linked
+/// files, drawings inside refused by the limits, pictures over them: [`crate::svg::Skipped`]).
+pub fn decode_for_room_noted(
+    path: &Path,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(RgbaImage, Option<String>), DecodeError> {
+    if crate::svg::is_svg(path) {
+        let drawing = crate::svg::Drawing::open(path)?;
+        let image = drawing.render_within(max_width, max_height)?;
+        return Ok((image, drawing.skipped().note()));
+    }
+    decode_for_room(path, max_width, max_height).map(|image| (image, None))
 }
 
 /// Reads `path` and turns it upright, at its own size.

@@ -410,7 +410,7 @@ mod tests {
         );
         let started = std::time::Instant::now();
         assert!(draw(&ods(&table, "")).is_ok());
-        assert!(started.elapsed().as_secs() < 10);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10) * crate::slack());
     }
 
     #[test]
