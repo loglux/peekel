@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use image::RgbaImage;
+/// The pixels of a picture (the type the pictures here are made of, for the callers that do not use `image` themselves).
+pub use image::RgbaImage;
 use image::imageops;
 
 use crate::decode::{Picture, halve, to_picture};
@@ -170,6 +171,9 @@ pub struct Image {
     /// The SVG the picture was drawn from, when it is one: a part of it shown enlarged is drawn again from its shapes
     /// ([`render_sharp`]).
     drawing: Option<Arc<Drawing>>,
+    /// The size of the whole picture when the pixels held are a smaller copy of it (a page of a scan drawn for the window): the zoom,
+    /// the place and the frames count in the whole picture's pixels, and the copy is enlarged where it has too few ([`Image::short`]).
+    whole: Option<Size>,
 }
 
 impl Image {
@@ -177,6 +181,7 @@ impl Image {
         Self {
             levels: vec![picture],
             drawing: None,
+            whole: None,
         }
     }
 
@@ -185,6 +190,34 @@ impl Image {
         Self {
             levels: vec![picture],
             drawing: Some(drawing),
+            whole: None,
+        }
+    }
+
+    /// `picture`, a smaller copy of a picture of size `whole` (the same shape, within rounding): it is looked at as the whole one,
+    /// at its size. A copy that is not smaller is the picture itself.
+    pub fn reduced(picture: RgbaImage, whole: Size) -> Self {
+        let smaller = picture.width() < whole.0 && whole.0 > 0 && whole.1 > 0;
+        Self {
+            levels: vec![picture],
+            drawing: None,
+            whole: smaller.then_some(whole),
+        }
+    }
+
+    /// When the pixels held are a smaller copy and `view` shows them enlarged (more than one pixel of the window for each held): the
+    /// scale of the view (in the whole picture's pixels), for the caller to make the picture again at least that large.
+    pub fn short(&self, view: &View, room: Room) -> Option<f64> {
+        self.whole?;
+        let scale = view.scale(self.size(), room);
+        (scale * self.factor() > 1.0 + 1e-3).then_some(scale)
+    }
+
+    /// The whole picture's pixels for one held: 1 unless the pixels held are a smaller copy.
+    fn factor(&self) -> f64 {
+        match (self.whole, self.levels.first()) {
+            (Some(whole), Some(first)) if first.width() > 0 => f64::from(whole.0) / f64::from(first.width()),
+            _ => 1.0,
         }
     }
 
@@ -193,8 +226,10 @@ impl Image {
         Self::new(RgbaImage::new(1, 1))
     }
 
+    /// The size of the picture: the whole one, when the pixels held are a smaller copy.
     pub fn size(&self) -> Size {
-        self.levels.first().map_or((0, 0), RgbaImage::dimensions)
+        self.whole
+            .unwrap_or_else(|| self.levels.first().map_or((0, 0), RgbaImage::dimensions))
     }
 
     /// The picture turned clockwise by `quarters` quarter turns (any number; 4 is no turn). The halved copies are dropped: they are
@@ -204,10 +239,15 @@ impl Image {
         if quarters.rem_euclid(4) == 0 {
             return self;
         }
+        let whole = self
+            .whole
+            .map(|(w, h)| if quarters.rem_euclid(2) == 1 { (h, w) } else { (w, h) });
         let Some(first) = self.levels.drain(..).next() else {
             return self;
         };
-        Self::new(turned_rgba(first, quarters))
+        let mut turned = Self::new(turned_rgba(first, quarters));
+        turned.whole = whole;
+        turned
     }
 
     /// The copy halved `wanted` times, or the smallest that exists when it cannot be halved that often.
@@ -243,24 +283,9 @@ pub const SPREAD_MAX_PIXELS: u64 = 150_000_000;
 /// without it each page keeps its own size and they hang from the top. `None` when there are no pages or the spread would have more
 /// than [`SPREAD_MAX_PIXELS`] (the caller shows the pages one by one then).
 pub fn side_by_side(pages: &[RgbaImage], equal_height: bool) -> Option<RgbaImage> {
-    let height = pages.iter().map(RgbaImage::height).max()?;
-    let scaled: Vec<(u32, u32)> = pages
-        .iter()
-        .map(|p| {
-            if equal_height && p.height() != height && p.height() > 0 {
-                let width = (f64::from(p.width()) * f64::from(height) / f64::from(p.height())).round() as u32;
-                (width.max(1), height)
-            } else {
-                p.dimensions()
-            }
-        })
-        .collect();
-    let gap = (height / 100).max(2);
-    let width = scaled.iter().map(|s| u64::from(s.0)).sum::<u64>() + u64::from(gap) * (pages.len() as u64 - 1);
-    if width == 0 || width * u64::from(height) > SPREAD_MAX_PIXELS || width > u64::from(u32::MAX) {
-        return None;
-    }
-    let mut out = RgbaImage::new(width as u32, height);
+    let sizes: Vec<Size> = pages.iter().map(RgbaImage::dimensions).collect();
+    let (scaled, gap, (width, height)) = laid_side_by_side(&sizes, equal_height)?;
+    let mut out = RgbaImage::new(width, height);
     let mut x = 0i64;
     for (page, size) in pages.iter().zip(scaled) {
         if size == page.dimensions() {
@@ -272,6 +297,33 @@ pub fn side_by_side(pages: &[RgbaImage], equal_height: bool) -> Option<RgbaImage
         x += i64::from(size.0) + i64::from(gap);
     }
     Some(out)
+}
+
+/// The size of the picture [`side_by_side`] makes of pages of these sizes, without making it; `None` as it would give `None`.
+pub fn side_by_side_size(pages: &[Size], equal_height: bool) -> Option<Size> {
+    laid_side_by_side(pages, equal_height).map(|(_, _, size)| size)
+}
+
+/// The size of each page in a spread, the gap between them and the size of the whole.
+fn laid_side_by_side(pages: &[Size], equal_height: bool) -> Option<(Vec<Size>, u32, Size)> {
+    let height = pages.iter().map(|p| p.1).max()?;
+    let scaled: Vec<Size> = pages
+        .iter()
+        .map(|&(w, h)| {
+            if equal_height && h != height && h > 0 {
+                let width = (f64::from(w) * f64::from(height) / f64::from(h)).round() as u32;
+                (width.max(1), height)
+            } else {
+                (w, h)
+            }
+        })
+        .collect();
+    let gap = (height / 100).max(2);
+    let width = scaled.iter().map(|s| u64::from(s.0)).sum::<u64>() + u64::from(gap) * (pages.len() as u64 - 1);
+    if width == 0 || width * u64::from(height) > SPREAD_MAX_PIXELS || width > u64::from(u32::MAX) {
+        return None;
+    }
+    Some((scaled, gap, (width as u32, height)))
 }
 
 /// What the window shows.
@@ -335,12 +387,9 @@ pub fn render(image: &mut Image, view: &View, room: Room) -> Option<Frame> {
     } = place(size, view, room)?;
 
     // from the copy halved as often as keeps the rest of the shrinking within 1/2 and 1: the largest k with
-    // scale * 2^k <= 1
-    let halvings = if scale < 1.0 {
-        (-scale.log2()).floor() as usize
-    } else {
-        0
-    };
+    // scale * 2^k <= 1 (the scale counted against the pixels held, which a smaller copy has fewer of)
+    let held = scale * image.factor();
+    let halvings = if held < 1.0 { (-held.log2()).floor() as usize } else { 0 };
     let level = image.level(halvings);
     let (fx, fy) = (
         f64::from(size.0) / f64::from(level.width()),
@@ -374,6 +423,58 @@ mod tests {
         Image::new(RgbaImage::from_fn(width, height, |x, y| {
             Rgba([(x / per_red).min(255) as u8, (y / per_green).min(255) as u8, 0, 255])
         }))
+    }
+
+    #[test]
+    fn a_smaller_copy_is_looked_at_as_the_whole_picture_and_says_when_it_is_short_of_pixels() {
+        // a picture of 4000 x 2000 held as a copy of 1000 x 500: the view counts in the whole one's pixels
+        let full = ramp(4000, 2000, 16, 8);
+        let small = imageops::resize(
+            full.levels.first().expect("a picture"),
+            1000,
+            500,
+            imageops::FilterType::Triangle,
+        );
+        let mut copy = Image::reduced(small, (4000, 2000));
+        assert_eq!(copy.size(), (4000, 2000));
+        let fit = View::new(copy.size());
+        // the whole picture in a room of 1000 x 580: a scale of a quarter, one pixel held for each pixel shown
+        assert!((fit.scale(copy.size(), ROOM) - 0.25).abs() < 1e-9);
+        assert_eq!(copy.short(&fit, ROOM), None);
+        let frame = render(&mut copy, &fit, ROOM).expect("a frame");
+        assert_eq!((frame.picture.width, frame.picture.height), (1000, 500));
+        // zoomed in: the copy has too few pixels, and says the scale the view needs
+        let mut close = fit;
+        close.zoom_by(2.0, copy.size(), ROOM);
+        assert!(copy.short(&close, ROOM).is_some_and(|s| (s - 0.5).abs() < 1e-9));
+        // a window twice as large shows the whole picture larger than the copy: short too
+        assert!(copy.short(&fit, (2000, 1160)).is_some());
+        // a copy that is not smaller is the picture itself, never short
+        let same = Image::reduced(RgbaImage::new(40, 20), (40, 20));
+        assert_eq!(same.short(&View::new((40, 20)), ROOM), None);
+        // turned a quarter, the whole size turns with it
+        let turned = Image::reduced(RgbaImage::new(100, 50), (400, 200)).turned(1);
+        assert_eq!(turned.size(), (200, 400));
+    }
+
+    #[test]
+    fn the_size_of_a_spread_is_worked_out_as_the_spread_is_made() {
+        let pages = [
+            RgbaImage::new(300, 400),
+            RgbaImage::new(150, 250),
+            RgbaImage::new(320, 400),
+        ];
+        let sizes: Vec<Size> = pages.iter().map(RgbaImage::dimensions).collect();
+        for equal in [true, false] {
+            let made = side_by_side(&pages, equal).expect("a spread");
+            assert_eq!(side_by_side_size(&sizes, equal), Some(made.dimensions()));
+        }
+        assert_eq!(side_by_side_size(&[], true), None);
+        assert_eq!(
+            side_by_side_size(&[(20_000, 20_000)], true),
+            None,
+            "over the limit of a spread"
+        );
     }
 
     #[test]

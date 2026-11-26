@@ -3,3 +3,10 @@ Written for Peekel (30 October 2026); core/tests/hostile.rs uses it as the file 
 sample.docx  made by a python script of the author's session (zipfile): a heading, a paragraph with bold and red italic
              words that wraps, two bullets, a centred line, a table of three columns with shading and borders, and a last
              paragraph. No picture.
+
+word-made.docx  made in Microsoft Word (16, through its COM interface, invisibly) for core/tests/docx_book.rs on 25 November
+             2026, all its text written for the test: a title, headings of levels 1 to 3, bold and italic runs, a numbered and
+             a bulleted list, a footnote, a table of 3 x 3 with a cell merged down and one across, an inline picture drawn for
+             the test (a blue rectangle with a red circle, 160 x 100), a page break and a second chapter with the word
+             "zebrafish". Title and author in its properties: "A test document of Peekel", "Peekel tests" (the last-saved-by
+             field set to the same after saving). Word's own PDF of it has 2 pages. No licence question.

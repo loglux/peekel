@@ -11,6 +11,7 @@ use crate::document::{DirectoryEntry, Document, Page};
 use crate::info::Rotation;
 use crate::iw44::{Iw44, Pixmap};
 use crate::jb2;
+use crate::scale;
 
 /// Where the dictionary of shapes a page uses is: the page's own `Djbz` chunk (with no name: it belongs to this page), or else the
 /// `Djbz` of the first `INCL` that names a component with one (with that name: the same dictionary serves every page that includes
@@ -64,6 +65,544 @@ fn layer(page: &Page<'_, '_>, id: [u8; 4], jpeg: [u8; 4]) -> Result<Option<Pixma
         .next()
         .map(|chunk| crate::jpeg::decode(chunk.data))
         .transpose()
+}
+
+/// How a page that is drawn smaller than it is gets its background (the picture under the mask, often a scan of 600 dpi: 20 million
+/// pixels drawn on a screen of 2 million).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shrink {
+    /// The background is made whole and each pixel of the small page is the mean of the pixels it covers: the most faithful, and
+    /// the slowest (our own way).
+    #[default]
+    Mean,
+    /// As DjVuLibre makes it (`ddjvu`'s pixels, for a page with no mask): the background is made at a power of two smaller from its
+    /// coarse coefficients only, then mixed down to the size two by two in sixteenths. Faster and with less memory; the halftone
+    /// of a printed picture may show as grain.
+    AsDjvulibre,
+    /// As `AsDjvulibre`, from the first chunk of the background only (its coarse first pass, often less than half of its bytes and of
+    /// the time of decoding it) when the background is stored at the page's resolution or half of it, a scan where its decoding is
+    /// the cost; a smaller one is decoded whole (its first chunk may be a kilobyte that leaves out the page number). A rougher
+    /// picture, for a look that needs only where the print is (the margins of a page), never for a page that is read.
+    FirstChunk,
+}
+
+/// The smallest whole number by which a picture of `w` x `h` is made `rw` x `rh` (each side rounded up), or 16 when there is none
+/// up to 15.
+fn reduction_of(w: usize, h: usize, rw: usize, rh: usize) -> usize {
+    (1..16)
+        .find(|&red| w.div_ceil(red) == rw && h.div_ceil(red) == rh)
+        .unwrap_or(16)
+}
+
+/// The background of a page of `width` x `height` made `subsample` times smaller (each side rounded up) as DjVuLibre makes it:
+/// directly from the coefficients when that is the background's own reduction times 1, 2, 4 or 8; else from them at the power of
+/// two below and mixed to the size. None when the page has no background (or one reduced by more than 12, which DjVuLibre does not
+/// draw either). Only the first `chunks` chunks of the background are decoded.
+fn background_subsampled(
+    page: &Page<'_, '_>,
+    width: usize,
+    height: usize,
+    subsample: usize,
+    chunks: usize,
+) -> Result<Option<Pixmap>, Error> {
+    let (out_w, out_h) = (width.div_ceil(subsample), height.div_ceil(subsample));
+    let mut picture = Iw44::new();
+    let mut any = false;
+    for chunk in page.chunks(*b"BG44").take(chunks) {
+        picture.add_chunk(chunk.data)?;
+        any = true;
+    }
+    let (layer, (bg_w, bg_h)) = if any {
+        let size = picture.size().ok_or(Error::BadIw44("no first chunk"))?;
+        (None, size)
+    } else {
+        // a JPEG background is made whole and mixed to the size (not compared with ddjvu)
+        match layer(page, *b"BG44", *b"BGjp")? {
+            Some(whole) => {
+                let size = (whole.width, whole.height);
+                (Some(whole), size)
+            }
+            None => return Ok(None),
+        }
+    };
+    let red = reduction_of(width, height, bg_w, bg_h);
+    if red > 12 {
+        return Ok(None);
+    }
+    if let Some(whole) = layer {
+        return Ok(scale::scaled(&whole, out_w, out_h, (red, subsample), (red, subsample)));
+    }
+    if let Some(k) = [1, 2, 4, 8].into_iter().find(|&k| subsample == k * red) {
+        let mut made = picture.pixmap_subsampled(k)?;
+        // the picture of the coefficients may be a pixel bigger than the page at that size; the rest is cut off
+        if (made.width, made.height) != (out_w, out_h) {
+            made = cropped(&made, out_w, out_h);
+        }
+        return Ok(Some(made));
+    }
+    // DjVuLibre has a way of its own for a reduction of 4 to 3, not done here: such a page is mixed as the others are
+    let mut po2 = 16;
+    while po2 > 1 && subsample < po2 * red {
+        po2 >>= 1;
+    }
+    let coarse = picture.pixmap_subsampled(po2)?;
+    Ok(scale::scaled(
+        &coarse,
+        out_w,
+        out_h,
+        (red * po2, subsample),
+        (red * po2, subsample),
+    ))
+}
+
+/// How many chunks of the background are decoded for a small page made the way `shrink` says: all of them, but the first only for
+/// `Shrink::FirstChunk` when the background is stored at the page's resolution or half of it.
+fn chunks_of(page: &Page<'_, '_>, shrink: Shrink) -> usize {
+    let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    let large = layer_size(page, *b"BG44").is_some_and(|(w, h)| reduction_of(width, height, w, h) <= 2);
+    if shrink == Shrink::FirstChunk && large {
+        1
+    } else {
+        usize::MAX
+    }
+}
+
+/// The part `w` x `h` at the bottom left of a picture (rows are counted from the bottom in DjVu), as big as the picture at most.
+fn cropped(picture: &Pixmap, w: usize, h: usize) -> Pixmap {
+    let (w, h) = (w.min(picture.width), h.min(picture.height));
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in picture.height - h..picture.height {
+        rgb.extend_from_slice(&picture.rgb[row * picture.width * 3..][..w * 3]);
+    }
+    Pixmap {
+        width: w,
+        height: h,
+        rgb,
+    }
+}
+
+/// The background of a page of `width` x `height` drawn `out_w` x `out_h` as DjVuLibre draws it: a whole reduction when the size is
+/// one (within one pixel of the reduction for each side), else the fastest of 12, 6, 4, 3, 2 that still leaves the background bigger
+/// than the size (or one at least three times bigger along a side), and the picture so made mixed to the size. Only the first
+/// `chunks` chunks of the background are decoded.
+fn background_as_djvulibre(
+    page: &Page<'_, '_>,
+    width: usize,
+    height: usize,
+    out_w: usize,
+    out_h: usize,
+    chunks: usize,
+) -> Result<Option<Pixmap>, Error> {
+    if let Some(red) = whole_reduction(width, height, out_w, out_h) {
+        return Ok(background_subsampled(page, width, height, red, chunks)?.map(|bg| cropped(&bg, out_w, out_h)));
+    }
+    let red = fast_reduction([12, 6, 4, 3, 2], width, height, out_w, out_h);
+    Ok(background_subsampled(page, width, height, red, chunks)?
+        .and_then(|bg| scale::scaled(&bg, out_w, out_h, (out_w * red, width), (out_h * red, height))))
+}
+
+/// The whole reduction, 1 to 15, that makes a page of `width` x `height` the size `out_w` x `out_h` give or take a pixel each way, as
+/// DjVuLibre looks for one first.
+fn whole_reduction(width: usize, height: usize, out_w: usize, out_h: usize) -> Option<usize> {
+    let near = |out: usize, page: usize, red: usize| out * red + red > page && out * red < page + red;
+    (1..=15).find(|&red| near(out_w, width, red) && near(out_h, height, red))
+}
+
+/// The first of `reductions` that still leaves the page bigger than `out_w` x `out_h`, or at least three times bigger along a side;
+/// else 1 (DjVuLibre: "these reductions usually go faster").
+fn fast_reduction(
+    reductions: impl IntoIterator<Item = usize>,
+    width: usize,
+    height: usize,
+    out_w: usize,
+    out_h: usize,
+) -> usize {
+    reductions
+        .into_iter()
+        .find(|&red| {
+            (out_w * red < width && out_h * red < height) || out_w * red * 3 < width || out_h * red * 3 < height
+        })
+        .unwrap_or(1)
+}
+
+/// The mask of a page counted at a reduction `red`, as DjVuLibre counts it: for each cell of `red` x `red` pixels of the page
+/// (counted from its bottom left, `width.div_ceil(red)` cells across), how many black pixels the shapes put there, the shapes that
+/// overlap adding (in a byte, as DjVuLibre's does). Only the blits for which `keep` is true are counted, and only in the cells
+/// `within` (x from, x to, y from, y to, the rows of cells from the bottom).
+struct Cells {
+    width: usize,
+    height: usize,
+    counts: Vec<u8>,
+}
+
+impl Cells {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            counts: vec![0; width * height],
+        }
+    }
+
+    /// Adds the black pixels of a bitmap whose top left pixel is at (`left`, `top`) of a page `page_height` high (rows from the top).
+    fn add(&mut self, bitmap: &jb2::Bitmap, left: i64, top: i64, page_height: usize, red: usize) {
+        if bitmap.width == 0 {
+            return;
+        }
+        let red = red as i64;
+        for (sy, line) in bitmap.pixels.chunks_exact(bitmap.width).enumerate() {
+            // the row from the bottom of the page, and the row of cells it falls in
+            let from_bottom = page_height as i64 - 1 - (top + sy as i64);
+            let cell_y = from_bottom.div_euclid(red);
+            if cell_y < 0 || cell_y >= self.height as i64 {
+                continue;
+            }
+            let row = &mut self.counts[cell_y as usize * self.width..][..self.width];
+            for (sx, &pixel) in line.iter().enumerate() {
+                if pixel == 0 {
+                    continue;
+                }
+                let cell_x = (left + sx as i64).div_euclid(red);
+                if cell_x >= 0 && cell_x < self.width as i64 {
+                    let cell = &mut row[cell_x as usize];
+                    *cell = cell.wrapping_add(1);
+                }
+            }
+        }
+    }
+}
+
+/// The share of a count of black pixels out of `most` (`red * red`), in 65536ths, as DjVuLibre's multiplier table has it.
+fn share(count: u8, most: u32) -> u32 {
+    0x10000 * u32::from(count) / most
+}
+
+/// What a page with a mask is made of, for drawing it small as DjVuLibre does.
+enum Ink<'s> {
+    /// No background and no colours: the page is drawn as grey levels.
+    Grey,
+    /// The shapes in the colours of a palette.
+    Palette(&'s Palette),
+    /// The shapes in the colours of a foreground picture.
+    Picture(Pixmap),
+    /// A background and black shapes (DjVuLibre draws such a page as grey levels with no background; here the background is kept).
+    Black,
+}
+
+/// The page with a mask drawn `out_w` x `out_h` as DjVuLibre draws it (`DjVuImage::get_pixmap`, `stencil`, `get_bitmap`; ddjvu's
+/// pixels): the mask counted at a whole reduction, the background at that reduction (made the way `background` says), the shapes
+/// put on by the share of black of each cell, and the whole mixed to the size by DjVuLibre's scaler. A page with no background and no
+/// colours goes the way DjVuLibre draws a black and white page: grey levels counted at the reduction and mixed to the size. None when
+/// the page has no mask (it is then made as any other).
+fn masked_as_djvulibre(
+    page: &Page<'_, '_>,
+    dictionary: Option<&jb2::Dictionary>,
+    out_w: usize,
+    out_h: usize,
+    background: Shrink,
+) -> Result<Option<Pixmap>, Error> {
+    let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    let shapes = page
+        .chunks(*b"Sjbz")
+        .next()
+        .map(|chunk| jb2::decode_shapes(chunk.data, dictionary))
+        .transpose()?;
+    let mmr = if shapes.is_none() { mask_of_mmr(page)? } else { None };
+    if shapes.is_none() && mmr.is_none() {
+        return Ok(None);
+    }
+    if let Some(mask) = &mmr
+        && (mask.width, mask.height) != (width, height)
+    {
+        return Err(Error::BadPage("the mask is not the size of the page"));
+    }
+    // the cells of the mask at a reduction, the blits for which `keep` says so
+    let count = |red: usize, keep: &dyn Fn(usize) -> bool| -> Cells {
+        let mut cells = Cells::new(width.div_ceil(red), height.div_ceil(red));
+        if let Some(drawn) = &shapes {
+            for (n, blit) in drawn.blits.iter().enumerate() {
+                if keep(n)
+                    && let Some(shape) = drawn.shape(dictionary, blit.shape)
+                {
+                    cells.add(shape, blit.left, blit.top, height, red);
+                }
+            }
+        } else if let Some(mask) = &mmr {
+            cells.add(mask, 0, 0, height, red);
+        }
+        cells
+    };
+    let has_background = page.chunks(*b"BG44").next().is_some() || page.chunks(*b"BGjp").next().is_some();
+    let colours = page.chunks(*b"FGbz").next().and_then(|chunk| palette(chunk.data));
+    let palette = colours
+        .as_ref()
+        .filter(|p| shapes.as_ref().is_some_and(|s| s.blits.len() == p.indices.len()));
+    let foreground = if palette.is_none() {
+        layer(page, *b"FG44", *b"FGjp")?
+    } else {
+        None
+    };
+    let ink = match (palette, foreground) {
+        (Some(p), _) => Ink::Palette(p),
+        (None, Some(fg)) if reduction_of(width, height, fg.width, fg.height) <= 12 => Ink::Picture(fg),
+        _ if has_background => Ink::Black,
+        _ => Ink::Grey,
+    };
+
+    // a page of black shapes on white: grey levels, as DjVuLibre's bitmap
+    if matches!(ink, Ink::Grey) {
+        let (red, whole) = match whole_reduction(width, height, out_w, out_h) {
+            Some(red) => (red, true),
+            None => (fast_reduction((2..=15).rev(), width, height, out_w, out_h), false),
+        };
+        let cells = count(red, &|_| true);
+        let most = (red * red) as u32;
+        if whole {
+            // the levels of the counts as ddjvu gives them: white less the share, rounded; a count past the most is black
+            let level = |c: u8| -> u8 {
+                if u32::from(c) > most {
+                    0
+                } else {
+                    (255 - (u32::from(c) * 255 + most / 2) / most) as u8
+                }
+            };
+            let grey = Pixmap {
+                width: cells.width,
+                height: cells.height,
+                rgb: cells.counts.iter().flat_map(|&c| [level(c); 3]).collect(),
+            };
+            return Ok(Some(cropped(&flipped(&grey), out_w, out_h)));
+        }
+        // the counts as darkness of 0 to 255, mixed to the size, then made light again
+        let dark = |c: u8| -> u8 {
+            if u32::from(c) > most {
+                255
+            } else {
+                ((u32::from(c) * 255 + most / 2) / most) as u8
+            }
+        };
+        let darkness = Pixmap {
+            width: cells.width,
+            height: cells.height,
+            rgb: cells.counts.iter().flat_map(|&c| [dark(c); 3]).collect(),
+        };
+        let darkness = flipped(&darkness);
+        return Ok(
+            scale::scaled(&darkness, out_w, out_h, (out_w * red, width), (out_h * red, height)).map(|mut small| {
+                for value in &mut small.rgb {
+                    *value = 255 - *value;
+                }
+                small
+            }),
+        );
+    }
+
+    // a page in colour: put together at a whole reduction, then mixed to the size
+    let (red, whole) = match whole_reduction(width, height, out_w, out_h) {
+        Some(red) => (red, true),
+        None => (fast_reduction([12, 6, 4, 3, 2], width, height, out_w, out_h), false),
+    };
+    let (cw, ch) = (width.div_ceil(red), height.div_ceil(red));
+    // the background at the reduction, rows from the bottom
+    let made = match background {
+        Shrink::AsDjvulibre | Shrink::FirstChunk => {
+            background_subsampled(page, width, height, red, chunks_of(page, background))?
+        }
+        Shrink::Mean => layer(page, *b"BG44", *b"BGjp")?.map(|bg| Pixmap {
+            width: cw,
+            height: ch,
+            rgb: shrunk(&bg, cw, ch),
+        }),
+    };
+    let mut rgb = match made {
+        Some(bg) if (bg.width, bg.height) == (cw, ch) => flipped(&bg).rgb,
+        _ => vec![255u8; cw * ch * 3],
+    };
+    let most = (red * red) as u32;
+    match &ink {
+        Ink::Palette(palette) => {
+            // the background darkened by the share of black of each cell
+            let cells = count(red, &|_| true);
+            for (pixel, &c) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(&cells.counts) {
+                if c == 0 {
+                    continue;
+                }
+                if u32::from(c) >= most {
+                    *pixel = [0; 3];
+                } else {
+                    let level = share(c, most);
+                    for value in pixel.iter_mut() {
+                        *value -= ((u32::from(*value) * level) >> 16) as u8;
+                    }
+                }
+            }
+            // then the colours added, one run of shapes at a time as DjVuLibre takes them: the shapes of one colour that follow
+            // each other left to right (others between them passed over), each run counted in the cells round its shapes
+            if let Some(drawn) = &shapes {
+                // the shapes that touch the page (DjVuLibre takes only those, which changes where the runs break)
+                let touches = |n: usize| {
+                    let blit = &drawn.blits[n];
+                    drawn.shape(dictionary, blit.shape).is_some_and(|s| {
+                        let bottom = height as i64 - blit.top - s.height as i64;
+                        blit.left <= width as i64
+                            && bottom <= height as i64
+                            && blit.left + s.width as i64 >= 0
+                            && bottom + s.height as i64 >= 0
+                    })
+                };
+                let mut left: Vec<usize> = (0..drawn.blits.len()).filter(|&n| touches(n)).collect();
+                while let Some(&first) = left.first() {
+                    let colour = usize::from(palette.indices[first]);
+                    let (mut run, mut rest, mut last_x, mut stopped) = (Vec::new(), Vec::new(), 0i64, false);
+                    for &n in &left {
+                        if stopped || drawn.blits[n].left < last_x {
+                            stopped = true;
+                            rest.push(n);
+                            continue;
+                        }
+                        last_x = drawn.blits[n].left;
+                        if usize::from(palette.indices[n]) == colour {
+                            run.push(n);
+                        } else {
+                            rest.push(n);
+                        }
+                    }
+                    // a first shape left of 0 would make no run (DjVuLibre would go round for ever): it is a run of its own
+                    if run.is_empty() {
+                        run.push(first);
+                        rest.retain(|&n| n != first);
+                    }
+                    left = rest;
+                    let Some(&ink) = palette.colours.get(colour) else {
+                        return Err(Error::BadPage("a shape has a colour the palette does not have"));
+                    };
+                    // the cells round the run: those its shapes touch, the edges of the hull rounded out
+                    let hull = run.iter().fold(None, |hull: Option<(i64, i64, i64, i64)>, &n| {
+                        let blit = &drawn.blits[n];
+                        let (w, h) = drawn
+                            .shape(dictionary, blit.shape)
+                            .map_or((0, 0), |s| (s.width as i64, s.height as i64));
+                        let bottom = height as i64 - blit.top - h;
+                        let this = (blit.left, bottom, blit.left + w, bottom + h);
+                        Some(hull.map_or(this, |(a, b, c, d)| {
+                            (a.min(this.0), b.min(this.1), c.max(this.2), d.max(this.3))
+                        }))
+                    });
+                    let Some((x0, y0, x1, y1)) = hull else { continue };
+                    let r = red as i64;
+                    let (cx0, cy0) = (x0.div_euclid(r).max(0), y0.div_euclid(r).max(0));
+                    let (cx1, cy1) = (
+                        (x1 + r - 1).div_euclid(r).min(cw as i64),
+                        (y1 + r - 1).div_euclid(r).min(ch as i64),
+                    );
+                    let members: std::collections::HashSet<usize> = run.into_iter().collect();
+                    let cells = count(red, &|n| members.contains(&n));
+                    for cy in cy0.max(0)..cy1 {
+                        for cx in cx0..cx1 {
+                            let at = cy as usize * cw + cx as usize;
+                            let c = cells.counts[at];
+                            if c == 0 {
+                                continue;
+                            }
+                            let pixel = &mut rgb[at * 3..at * 3 + 3];
+                            for (value, &add) in pixel.iter_mut().zip(&ink) {
+                                let add = if u32::from(c) >= most {
+                                    u32::from(add)
+                                } else {
+                                    (u32::from(add) * share(c, most)) >> 16
+                                };
+                                *value = (u32::from(*value) + add).min(255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ink::Picture(fg) => {
+            // the foreground made as big as the cells by a whole number (mixed first when it is not one), each cell mixed toward it
+            let fg_red = reduction_of(width, height, fg.width, fg.height);
+            let supersample = if fg_red > red { fg_red / red } else { 1 };
+            let wanted = supersample * red;
+            let colour = if fg_red == wanted {
+                flipped(fg)
+            } else {
+                let (dw, dh) = (
+                    (fg.width * fg_red).div_ceil(wanted),
+                    (fg.height * fg_red).div_ceil(wanted),
+                );
+                let mixed = scale::scaled(fg, dw, dh, (fg_red, wanted), (fg_red, wanted))
+                    .ok_or(Error::BadPage("the foreground could not be made"))?;
+                flipped(&mixed)
+            };
+            let cells = count(red, &|_| true);
+            for cy in 0..ch {
+                let fy = (cy / supersample).min(colour.height.saturating_sub(1));
+                for cx in 0..cw {
+                    let at = cy * cw + cx;
+                    let c = cells.counts[at];
+                    if c == 0 {
+                        continue;
+                    }
+                    let fx = (cx / supersample).min(colour.width.saturating_sub(1));
+                    let ink = &colour.rgb[(fy * colour.width + fx) * 3..][..3];
+                    let pixel = &mut rgb[at * 3..at * 3 + 3];
+                    if u32::from(c) >= most {
+                        pixel.copy_from_slice(ink);
+                    } else {
+                        let level = share(c, most) as i32;
+                        for (value, &target) in pixel.iter_mut().zip(ink) {
+                            let v = i32::from(*value);
+                            *value = (v - (((v - i32::from(target)) * level) >> 16)) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        Ink::Black | Ink::Grey => {
+            let cells = count(red, &|_| true);
+            for (pixel, &c) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(&cells.counts) {
+                if c == 0 {
+                    continue;
+                }
+                if u32::from(c) >= most {
+                    *pixel = [0; 3];
+                } else {
+                    let level = share(c, most);
+                    for value in pixel.iter_mut() {
+                        *value -= ((u32::from(*value) * level) >> 16) as u8;
+                    }
+                }
+            }
+        }
+    }
+    let together = flipped(&Pixmap {
+        width: cw,
+        height: ch,
+        rgb,
+    });
+    if whole {
+        return Ok(Some(cropped(&together, out_w, out_h)));
+    }
+    Ok(scale::scaled(
+        &together,
+        out_w,
+        out_h,
+        (out_w * red, width),
+        (out_h * red, height),
+    ))
+}
+
+/// A picture with its rows the other way up (rows from the top to rows from the bottom, or back).
+fn flipped(picture: &Pixmap) -> Pixmap {
+    let mut rgb = Vec::with_capacity(picture.rgb.len());
+    for row in picture.rgb.chunks_exact((picture.width * 3).max(1)).rev() {
+        rgb.extend_from_slice(row);
+    }
+    Pixmap {
+        width: picture.width,
+        height: picture.height,
+        rgb,
+    }
 }
 
 /// The mask of a page that has no `Sjbz` (JB2) chunk, from its `Smmr` (Fax G4) chunk; None when the page has neither.
@@ -280,6 +819,31 @@ pub fn render_within(
     max_width: usize,
     max_height: usize,
 ) -> Result<Pixmap, Error> {
+    render_within_by(page, dictionary, max_width, max_height, Small::default())
+}
+
+/// How a page drawn small is made: its background, and its mask with the colours of its shapes, each our way (`Shrink::Mean`)
+/// or DjVuLibre's (`Shrink::AsDjvulibre`). Both DjVuLibre's: ddjvu's pixels (docs/internal/djvu.md, "A smaller page as DjVuLibre
+/// makes it", for what differs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Small {
+    pub background: Shrink,
+    /// Ours: each small pixel gets the share of black of the pixels of the page it covers, sharp letters. DjVuLibre's: the page is
+    /// put together at a whole reduction and then mixed to the size, softer letters and smoother pictures drawn in dots.
+    pub mask: Shrink,
+}
+
+/// As [`render_within`], the small page made the way `look` says.
+///
+/// # Errors
+/// As [`render`].
+pub fn render_within_by(
+    page: &Page<'_, '_>,
+    dictionary: Option<&jb2::Dictionary>,
+    max_width: usize,
+    max_height: usize,
+    look: Small,
+) -> Result<Pixmap, Error> {
     let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
     if width * height > MAX_PIXELS {
         return Err(Error::BadPage("the page has more pixels than the limit"));
@@ -294,12 +858,56 @@ pub fn render_within(
         if scale <= 0.5 {
             // the size that a shrinking to the box gives: each side by the scale, rounded, halves to even, and not less than 1
             let side = |n: usize| ((n as f64 * scale).round_ties_even() as usize).max(1);
-            if let Some(small) = reduced(page, dictionary, side(width), side(height))? {
+            if let Some(small) = reduced(page, dictionary, side(width), side(height), look)? {
                 return Ok(turned(corrected(small, page.info.gamma), page.info.rotation));
             }
         }
     }
     render_with(page, dictionary)
+}
+
+/// The page made exactly `out_w` x `out_h` pixels (the page as it is shown, turned as its `INFO` says), each side scaled on its own,
+/// for a caller that cuts a part of it and needs that part at a size to the pixel. At half the page or less along both sides it is made
+/// small directly as [`render_within_by`] makes it, the way `look` says; else (or when the background is too small for that) the whole
+/// page is made and each pixel is the mean of the pixels it covers. A size bigger than the page is the page's size.
+///
+/// # Errors
+/// As [`render`].
+pub fn render_exact(
+    page: &Page<'_, '_>,
+    dictionary: Option<&jb2::Dictionary>,
+    out_w: usize,
+    out_h: usize,
+    look: Small,
+) -> Result<Pixmap, Error> {
+    let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    if width * height > MAX_PIXELS {
+        return Err(Error::BadPage("the page has more pixels than the limit"));
+    }
+    // the size in the orientation the page is stored in, at least 1 and at most the page
+    let (out_w, out_h) = match page.info.rotation {
+        Rotation::Ccw90 | Rotation::Cw90 => (out_h, out_w),
+        Rotation::None | Rotation::Turn180 => (out_w, out_h),
+    };
+    let (out_w, out_h) = (out_w.clamp(1, width.max(1)), out_h.clamp(1, height.max(1)));
+    if out_w * 2 <= width
+        && out_h * 2 <= height
+        && let Some(small) = reduced(page, dictionary, out_w, out_h, look)?
+        && (small.width, small.height) == (out_w, out_h)
+    {
+        return Ok(turned(corrected(small, page.info.gamma), page.info.rotation));
+    }
+    // the whole page, stored the way round it is drawn in, shrunk; then turned as the small one is
+    let whole = render_with(page, dictionary)?;
+    let (shown_w, shown_h) = match page.info.rotation {
+        Rotation::Ccw90 | Rotation::Cw90 => (out_h, out_w),
+        Rotation::None | Rotation::Turn180 => (out_w, out_h),
+    };
+    Ok(Pixmap {
+        width: shown_w,
+        height: shown_h,
+        rgb: shrunk(&whole, shown_w, shown_h),
+    })
 }
 
 /// The size of the picture that the first chunk of the layer `id` gives (the header of the chunk), without decoding the picture.
@@ -320,8 +928,15 @@ fn reduced(
     dictionary: Option<&jb2::Dictionary>,
     out_w: usize,
     out_h: usize,
+    look: Small,
 ) -> Result<Option<Pixmap>, Error> {
     let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    if look.mask == Shrink::AsDjvulibre
+        && let Some(small) = masked_as_djvulibre(page, dictionary, out_w, out_h, look.background)?
+    {
+        return Ok(Some(small));
+    }
+    let shrink = look.background;
     // an Fax G4 mask is not read as shapes: the whole page is made and the caller shrinks it
     if page.chunks(*b"Smmr").next().is_some() {
         return Ok(None);
@@ -333,10 +948,16 @@ fn reduced(
     }
     // the background (its own picture shrunk to the size) and the foreground picture are made on a thread while the shapes are
     let layers = || -> Result<(Option<Vec<u8>>, Option<Pixmap>), Error> {
-        let rgb = match layer(page, *b"BG44", *b"BGjp")? {
-            Some(bg) if out_w <= bg.width && out_h <= bg.height => Some(shrunk(&bg, out_w, out_h)),
-            Some(_) => None,
-            None => Some(vec![255u8; out_w * out_h * 3]),
+        let rgb = match shrink {
+            Shrink::Mean => match layer(page, *b"BG44", *b"BGjp")? {
+                Some(bg) if out_w <= bg.width && out_h <= bg.height => Some(shrunk(&bg, out_w, out_h)),
+                Some(_) => None,
+                None => Some(vec![255u8; out_w * out_h * 3]),
+            },
+            Shrink::AsDjvulibre | Shrink::FirstChunk => Some(
+                background_as_djvulibre(page, width, height, out_w, out_h, chunks_of(page, shrink))?
+                    .map_or_else(|| vec![255u8; out_w * out_h * 3], |bg| bg.rgb),
+            ),
         };
         Ok((rgb, layer(page, *b"FG44", *b"FGjp")?))
     };
@@ -1015,6 +1636,191 @@ mod tests {
         }
         // a box that has no area is not a reason to fail
         assert!(within(&bytes, 0, 0).is_ok());
+    }
+
+    /// The background and the mask both made as DjVuLibre makes them.
+    const DJVULIBRE: Small = Small {
+        background: Shrink::AsDjvulibre,
+        mask: Shrink::AsDjvulibre,
+    };
+
+    /// A glance at a page for its margins, as the core makes it.
+    const GLANCE: Small = Small {
+        background: Shrink::FirstChunk,
+        mask: Shrink::Mean,
+    };
+
+    fn ramp_chunks() -> Vec<(&'static [u8; 4], &'static [u8])> {
+        [
+            &RAMP_0[..],
+            &RAMP_1,
+            &RAMP_2,
+            &RAMP_3,
+            &RAMP_4,
+            &RAMP_5,
+            &RAMP_6,
+            &RAMP_7,
+        ]
+        .iter()
+        .map(|c| (b"BG44", *c))
+        .collect()
+    }
+
+    #[test]
+    fn a_page_made_small_as_djvulibre_makes_it_has_the_coarse_background_or_a_mix_of_it() {
+        let as_djvulibre = |file: &[u8], w: usize, h: usize| {
+            let document = Document::parse(file).unwrap();
+            render_within_by(
+                &document.page(0).unwrap(),
+                None,
+                w,
+                h,
+                Small {
+                    background: Shrink::AsDjvulibre,
+                    mask: Shrink::Mean,
+                },
+            )
+            .unwrap()
+        };
+        // a background as big as the page drawn at exactly a half: the picture of its coarse coefficients, nothing mixed
+        let bytes = file(24, 24, &ramp_chunks());
+        let mut picture = Iw44::new();
+        for (_, chunk) in ramp_chunks() {
+            picture.add_chunk(chunk).unwrap();
+        }
+        assert_eq!(as_djvulibre(&bytes, 12, 12), picture.pixmap_subsampled(2).unwrap());
+        // at a size that is no whole reduction (24 to 10): the fastest reduction that leaves it bigger is 2, so the coarse picture
+        // of 12 x 12, mixed down to 10 x 10 with 20 pixels standing for 24
+        let small = as_djvulibre(&bytes, 10, 10);
+        let coarse = picture.pixmap_subsampled(2).unwrap();
+        assert_eq!(Some(small), scale::scaled(&coarse, 10, 10, (20, 24), (20, 24)));
+        // a background three times smaller than the page (a reduction DjVuLibre draws its own way, mixed here)
+        let bytes = ramp_page();
+        for (w, h) in [(18, 18), (20, 10), (30, 30)] {
+            let small = as_djvulibre(&bytes, w, h);
+            let mean = within(&bytes, w, h).unwrap();
+            assert_eq!((small.width, small.height), (mean.width, mean.height), "{w} x {h}");
+        }
+    }
+
+    #[test]
+    fn a_page_made_exactly_a_size_has_that_size_each_side_on_its_own() {
+        let exact = |file: &[u8], w: usize, h: usize| {
+            let document = Document::parse(file).unwrap();
+            render_exact(&document.page(0).unwrap(), None, w, h, Small::default()).unwrap()
+        };
+        // the page of 72 x 72 with a background three times smaller: small sizes of other proportions, and bigger ones
+        let bytes = ramp_page();
+        for (w, h) in [(36, 36), (35, 17), (11, 30), (1, 1), (50, 60), (72, 72), (100, 40)] {
+            let page = exact(&bytes, w, h);
+            assert_eq!((page.width, page.height), (w.min(72), h.min(72)), "{w} x {h}");
+            assert_eq!(page.rgb.len(), page.width * page.height * 3);
+        }
+        // at a size a box gives too, the same pixels as the page made small for the box
+        let document = Document::parse(&bytes).unwrap();
+        let within = render_within_by(&document.page(0).unwrap(), None, 24, 24, Small::default()).unwrap();
+        assert_eq!(exact(&bytes, 24, 24), within);
+        // a page of letters (a mask, no background)
+        let bytes = file(170, 96, &[(b"Sjbz", &jb2::tests::LETTERS[..])]);
+        let page = exact(&bytes, 61, 29);
+        assert_eq!((page.width, page.height), (61, 29));
+    }
+
+    #[test]
+    fn a_glance_at_a_page_decodes_only_the_first_chunk_of_a_background_as_big_as_the_page() {
+        let small = |file: &[u8], w: usize, h: usize, background: Shrink| {
+            let document = Document::parse(file).unwrap();
+            let look = Small {
+                background,
+                mask: Shrink::Mean,
+            };
+            render_within_by(&document.page(0).unwrap(), None, w, h, look).unwrap()
+        };
+        // a background as big as the page, at a half: the coarse picture of its first chunk alone, not of them all
+        let bytes = file(24, 24, &ramp_chunks());
+        let mut first = Iw44::new();
+        first.add_chunk(ramp_chunks()[0].1).unwrap();
+        let glance = small(&bytes, 12, 12, Shrink::FirstChunk);
+        assert_eq!(glance, first.pixmap_subsampled(2).unwrap());
+        assert_ne!(glance, small(&bytes, 12, 12, Shrink::AsDjvulibre));
+        // a background three times smaller than the page is decoded whole: its first chunk may leave out a page number
+        let bytes = ramp_page();
+        assert_eq!(
+            small(&bytes, 18, 18, Shrink::FirstChunk),
+            small(&bytes, 18, 18, Shrink::AsDjvulibre)
+        );
+    }
+
+    #[test]
+    fn a_black_and_white_page_made_small_as_djvulibre_is_the_share_of_black_of_each_cell() {
+        // a page of letters (170 x 96) at exactly a half: each pixel is white less the share of black of its 2 x 2 cell, the cells
+        // counted from the bottom of the page, rounded as ddjvu rounds the grey levels of a bitmap
+        let stream = &jb2::tests::LETTERS[..];
+        let bytes = file(170, 96, &[(b"Sjbz", stream)]);
+        let mask = jb2::decode_image(stream, None).unwrap();
+        let document = Document::parse(&bytes).unwrap();
+        let small = render_within_by(&document.page(0).unwrap(), None, 85, 48, DJVULIBRE).unwrap();
+        assert_eq!((small.width, small.height), (85, 48));
+        for y in 0..48 {
+            for x in 0..85 {
+                let black: u32 = (0..2)
+                    .flat_map(|dy| (0..2).map(move |dx| (dx, dy)))
+                    .map(|(dx, dy)| u32::from(mask.pixels[(2 * y + dy) * 170 + 2 * x + dx] != 0))
+                    .sum();
+                let expected = (255 - (black * 255 + 2) / 4) as u8;
+                assert_eq!(small.rgb[(y * 85 + x) * 3..][..3], [expected; 3], "at {x}, {y}");
+            }
+        }
+        // at a size that is not a whole reduction the page is still the size asked, and our way gives the same size
+        let small = render_within_by(&document.page(0).unwrap(), None, 60, 40, DJVULIBRE).unwrap();
+        let ours = render_within(&document.page(0).unwrap(), None, 60, 40).unwrap();
+        assert_eq!((small.width, small.height), (ours.width, ours.height));
+    }
+
+    #[test]
+    fn cells_count_the_black_pixels_from_the_bottom_left_and_overlaps_add() {
+        // a 3 x 3 shape on a page 5 high at a reduction of 2: the rows from the bottom are 4 - top - row
+        let shape = jb2::Bitmap {
+            width: 3,
+            height: 3,
+            pixels: vec![1; 9],
+        };
+        let mut cells = Cells::new(3, 3);
+        cells.add(&shape, 1, 0, 5, 2);
+        // the shape covers x 1..4 and, from the bottom, rows 2..5: cells x 0 (one column), 1 (two); y 1 (row 2, 3), 2 (row 4)
+        assert_eq!(cells.counts, vec![0, 0, 0, 2, 4, 0, 1, 2, 0]);
+        cells.add(&shape, 1, 0, 5, 2);
+        assert_eq!(cells.counts[4], 8);
+        // a shape left of the page and above it adds where its pixels fall in a cell: its last column (x 0) and, from the bottom,
+        // its rows 5 and 4, which the top cell (rows 4 and 5) holds though row 5 is past the top of the page, as DjVuLibre counts
+        let mut cells = Cells::new(3, 3);
+        cells.add(&shape, -2, -2, 5, 2);
+        assert_eq!(cells.counts, vec![0, 0, 0, 0, 0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn data_for_a_page_made_small_as_djvulibre_is_an_error_or_a_picture_and_never_a_panic() {
+        let good = file(24, 24, &ramp_chunks());
+        for len in (0..good.len()).step_by(7) {
+            if let Ok(document) = Document::parse(&good[..len])
+                && let Ok(page) = document.page(0)
+            {
+                let _ = render_within_by(&page, None, 10, 10, DJVULIBRE);
+                let _ = render_within_by(&page, None, 10, 10, GLANCE);
+                let _ = render_exact(&page, None, 11, 7, DJVULIBRE);
+            }
+        }
+        let mut bad = good.clone();
+        for (i, byte) in bad.iter_mut().enumerate().skip(40) {
+            *byte ^= (i * 37) as u8;
+        }
+        if let Ok(document) = Document::parse(&bad)
+            && let Ok(page) = document.page(0)
+        {
+            let _ = render_within_by(&page, None, 9, 7, DJVULIBRE);
+            let _ = render_within_by(&page, None, 9, 7, GLANCE);
+            let _ = render_exact(&page, None, 9, 7, Small::default());
+        }
     }
 
     #[test]

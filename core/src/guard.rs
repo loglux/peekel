@@ -24,7 +24,7 @@ pub fn has_extension(path: &Path, ext: &str) -> bool {
 /// The bytes of `path`; a file bigger than `max` is refused before it is read.
 pub fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>, DecodeError> {
     if std::fs::metadata(path).map_err(unreadable)?.len() > max {
-        return Err(DecodeError::TooLarge);
+        return Err(DecodeError::FileTooLarge(max));
     }
     std::fs::read(path).map_err(unreadable)
 }
@@ -54,4 +54,23 @@ pub fn le_u16(data: &[u8], at: usize) -> Option<u16> {
 /// The little-endian `u32` at `at`, if the data reaches that far.
 pub fn le_u32(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // a test that cannot make its file should stop at once
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_over_its_limit_is_refused_with_the_limit_of_bytes_not_of_pixels() {
+        let path = std::env::temp_dir().join(format!("peekel-guard-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0u8; 1024 * 1024 + 1]).expect("makes the file");
+        let refused = read_limited(&path, 1024 * 1024);
+        let _ = std::fs::remove_file(&path);
+        let Err(e) = refused else {
+            panic!("a file over the limit was read");
+        };
+        assert!(matches!(e, DecodeError::FileTooLarge(1_048_576)));
+        assert_eq!(e.to_string(), "the file is too large (over 1 MB)");
+    }
 }

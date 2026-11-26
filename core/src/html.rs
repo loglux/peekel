@@ -441,6 +441,16 @@ pub fn render_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
     book::page(&*book::laid(path, blocks)?, page)
 }
 
+/// As [`render_page`], drawn at the size at which it fits the box `max_width` x `max_height` pixels (`book::page_within`).
+pub fn render_page_within(
+    path: &Path,
+    page: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(RgbaImage, usize), DecodeError> {
+    book::page_within(&*book::laid(path, blocks)?, page, max_width, max_height)
+}
+
 /// The text of every page, for a search.
 pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     Ok(book::texts(&*book::laid(path, blocks)?))

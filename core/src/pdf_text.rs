@@ -193,7 +193,7 @@ fn letters_of(page: &Page<'_>, pdf: &Pdf) -> Vec<Letter> {
 
 fn read(path: &Path) -> Result<Vec<u8>, DecodeError> {
     if std::fs::metadata(path).map_err(unreadable)?.len() > MAX_BYTES {
-        return Err(DecodeError::TooLarge);
+        return Err(DecodeError::FileTooLarge(MAX_BYTES));
     }
     std::fs::read(path).map_err(unreadable)
 }
@@ -224,16 +224,52 @@ pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     })?
 }
 
-/// The text and words of page `page` (counted from 0), and the size of the page in pixels at a scale of one.
+/// The text and words of page `page` (counted from 0; past the end, the last, as the drawing does), and the size of the page in
+/// pixels at a scale of one.
 pub fn page_words(path: &Path, page: usize) -> Result<(PageText, (u32, u32)), DecodeError> {
     let data = read(path)?;
     on_thread(PAGE_TIME, move || {
         let pdf = open(data)?;
         let pages = pdf.pages();
-        let page = pages.get(page).ok_or_else(|| unreadable("no such page"))?;
+        let page = pages
+            .get(page.min(pages.len().saturating_sub(1)))
+            .ok_or_else(|| unreadable("no such page"))?;
         let (width, height) = page.render_dimensions();
         let size = (width.max(0.0) as u32, height.max(0.0) as u32);
         Ok((words_of(&letters_of(page, &pdf)), size))
+    })?
+}
+
+/// A page's number, its words and its size in pixels at a scale of one.
+pub type NumberedPage = (usize, PageText, (u32, u32));
+
+/// The words of the pages `pages` (counted from 0; past the end left out), the file read and opened once, with the size of each page
+/// in pixels at a scale of one; within the time and the letters of a whole book, the pages not reached left out.
+pub fn pages_words(path: &Path, pages: &[usize]) -> Result<Vec<NumberedPage>, DecodeError> {
+    let data = read(path)?;
+    let pages = pages.to_vec();
+    on_thread(BOOK_TIME, move || {
+        let pdf = open(data)?;
+        let all = pdf.pages();
+        let started = std::time::Instant::now();
+        let mut read = 0usize;
+        let mut out = Vec::new();
+        for number in pages {
+            // the book's limits are kept with room to spare: what is read by then is enough to judge by
+            if read >= MAX_BOOK || started.elapsed() >= BOOK_TIME / 2 {
+                break;
+            }
+            let Some(page) = all.get(number) else { continue };
+            let (width, height) = page.render_dimensions();
+            let letters = letters_of(page, &pdf);
+            read += letters.len();
+            out.push((
+                number,
+                words_of(&letters),
+                (width.max(0.0) as u32, height.max(0.0) as u32),
+            ));
+        }
+        Ok(out)
     })?
 }
 

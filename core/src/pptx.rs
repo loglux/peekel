@@ -727,6 +727,7 @@ impl Ctx<'_> {
                     bold: merged.bold.unwrap_or(false),
                     italic: merged.italic.unwrap_or(false),
                     underline: merged.underline.unwrap_or(false),
+                    strike: false,
                     colour: merged.colour.unwrap_or([0, 0, 0]),
                     family: merged.family.clone(),
                 }

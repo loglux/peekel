@@ -41,7 +41,7 @@ const MAX_TITLE: usize = 300;
 /// An unreadable file, a file too big, a file with a password, a reading that takes too long.
 pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
     if std::fs::metadata(path).map_err(unreadable)?.len() > MAX_BYTES {
-        return Err(DecodeError::TooLarge);
+        return Err(DecodeError::FileTooLarge(MAX_BYTES));
     }
     let data = std::fs::read(path).map_err(unreadable)?;
     on_thread(TIMEOUT, move || read_contents(data))?

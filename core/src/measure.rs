@@ -75,9 +75,22 @@ fn advance(font: &FontRef<'_>, c: char) -> Option<f32> {
     (units_per_em > 0.0).then(|| advance / units_per_em)
 }
 
-/// The face the renderer would take for a family list (`Georgia, Liberation Serif, serif`), read into memory.
+/// The face the renderer takes for a family list (`Georgia, Liberation Serif, serif`), read into memory.
 fn load(db: &Database, families: &str, bold: bool, italic: bool) -> Option<Face> {
-    let names: Vec<Family<'_>> = families
+    let id = face(db, families, bold, italic)?;
+    let (data, index) = db.with_face_data(id, |data, index| (data.to_vec(), index))?;
+    Some(Face {
+        data: Arc::new(data),
+        index,
+        widths: HashMap::new(),
+    })
+}
+
+/// The face the renderer takes for a family list: the first family of it that `db` has, else the serif family, as `usvg`'s own choice
+/// of a font does (`default_font_selector`). Without that last step a list none of whose families is installed (the core's monospace
+/// list on Android, Peekel TV, #235) was measured by the rough table and drawn in the serif face, and its words ran into each other.
+fn face(db: &Database, families: &str, bold: bool, italic: bool) -> Option<ID> {
+    let mut names: Vec<Family<'_>> = families
         .split(',')
         .map(str::trim)
         .filter(|n| !n.is_empty())
@@ -88,17 +101,12 @@ fn load(db: &Database, families: &str, bold: bool, italic: bool) -> Option<Face>
             _ => Family::Name(name),
         })
         .collect();
-    let id: ID = db.query(&Query {
+    names.push(Family::Serif);
+    db.query(&Query {
         families: &names,
         weight: if bold { Weight::BOLD } else { Weight::NORMAL },
         stretch: Stretch::Normal,
         style: if italic { Style::Italic } else { Style::Normal },
-    })?;
-    let (data, index) = db.with_face_data(id, |data, index| (data.to_vec(), index))?;
-    Some(Face {
-        data: Arc::new(data),
-        index,
-        widths: HashMap::new(),
     })
 }
 
@@ -123,6 +131,34 @@ mod tests {
             ..font.clone()
         };
         assert!((width("Word", &big) - 2.0 * width("Word", &font)).abs() < 0.01);
+    }
+
+    /// A database of one face: the serif face of this machine's fonts, alone, as on a system whose fonts have no monospace face the
+    /// core knows by name (Android's); `None` on a machine with no serif face at all.
+    fn serif_only() -> Option<(Database, Vec<u8>)> {
+        let all = crate::svg::fonts();
+        let id = all.query(&Query {
+            families: &[Family::Serif],
+            ..Query::default()
+        })?;
+        let data = all.with_face_data(id, |data, _| data.to_vec())?;
+        let mut db = Database::new();
+        db.load_font_data(data.clone());
+        crate::svg::set_generic_families(&mut db);
+        Some((db, data))
+    }
+
+    #[test]
+    fn a_family_list_with_nothing_installed_is_measured_in_the_serif_face_it_is_drawn_in() {
+        let Some((db, data)) = serif_only() else {
+            return;
+        };
+        // the core's list for a line of code, as a page names it
+        let mono = crate::page::family(Some("Consolas, Courier New, monospace"));
+        for (bold, italic) in [(false, false), (true, false), (false, true)] {
+            let face = load(&db, &mono, bold, italic).map(|f| f.data.as_ref().clone());
+            assert_eq!(face.as_ref(), Some(&data), "{mono} {bold} {italic}");
+        }
     }
 
     #[test]

@@ -235,6 +235,7 @@ impl Props {
             bold: self.bold.unwrap_or(false),
             italic: self.italic.unwrap_or(false),
             underline: self.underline.unwrap_or(false),
+            strike: false,
             colour: self.colour.unwrap_or([0, 0, 0]),
             family: self.family.clone(),
         }

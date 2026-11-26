@@ -1,10 +1,10 @@
 //! EPUB, the e-book of most shops and libraries: a ZIP with a package file (OPF: the description of the book, the list of its parts,
 //! their order) and the text as XHTML files, one a chapter or so. Read into the blocks of `book`, as FB2 is, and laid out the same way:
 //! the cover, each part of the order on a new page, headings, paragraphs with emphasis and strong, lists, quotations, preformatted
-//! text, tables (a row a line), pictures. The contents come from the book's own (`nav.xhtml` of EPUB 3, `toc.ncx` of EPUB 2), and
-//! lead to a part or to a place inside one. The style sheets are hardly read: a book is set as every book here is (`book`), with what
-//! the markup says (a heading, emphasis) and a centred line where a `style` or a class says `center`. Only the classes the sheets set
-//! in a monospace font are taken from them: many books mark their listings so and not with `pre` (`mono_classes`).
+//! text, tables, pictures. The contents come from the book's own (`nav.xhtml` of EPUB 3, `toc.ncx` of EPUB 2), and lead to a part or
+//! to a place inside one. The style sheets a part links and holds go through the cascade (`css`): each element's display, margins,
+//! indent, alignment, background and whether it is set in a monospace font (many books mark their listings so and not with `pre`).
+//! A part with no sheet at all keeps the look of the books here (`css::PLAIN_SHEET`).
 //!
 //! A book with DRM (`META-INF/rights.xml`, or `encryption.xml` naming a cipher that is not the obfuscation of fonts) is not opened:
 //! its text cannot be read without the shop's key, and the card says so. Limits: the file (`MAX_BYTES`), each part unpacked
@@ -15,12 +15,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use image::RgbaImage;
 use roxmltree::Node;
 
 use crate::archive::Archive;
 use crate::book::{self, Align, Block, SIZE, Span, Style};
+use crate::css::{self, Cascade, Computed, Display, Marker, Origin, Shift};
 use crate::decode::{ContentsItem, DecodeError};
 use crate::fb2::{decode_text, plain_text};
 use crate::guard::{read_limited, unreadable};
@@ -32,6 +34,8 @@ pub const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PART: usize = 64 * 1024 * 1024;
 /// The largest picture file unpacked.
 const MAX_PICTURE: usize = 64 * 1024 * 1024;
+/// The most letters (not counting spaces) of a first part whose picture is taken for the cover when the package names none.
+const MAX_COVER_TEXT: usize = 100;
 /// Parts of the order read at most.
 const MAX_SPINE: usize = 5_000;
 /// Elements nested deeper than this are read as plain text.
@@ -39,17 +43,20 @@ const MAX_DEPTH: usize = 64;
 /// Lines of the contents read at most, and the longest one, in characters.
 const MAX_TOC: usize = 20_000;
 const MAX_TITLE: usize = 200;
+/// The longest paragraph before a table taken for its caption (`Reader::keep_caption`), in letters.
+const MAX_CAPTION: usize = 200;
 /// The most blocks a book makes.
 const MAX_BLOCKS: usize = 4_000_000;
 /// Style sheets read at most, and the largest one read.
 const MAX_SHEETS: usize = 100;
 const MAX_SHEET: usize = 4 * 1024 * 1024;
 
-/// Whether the name says EPUB.
+/// Whether the name says EPUB, or, for a file with no extension, its first bytes (`sniff`).
 pub fn is_epub(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+        || crate::sniff::sniffed(path) == Some(crate::sniff::Sniffed::Epub)
 }
 
 /// Whether an archive is an EPUB: its `mimetype` says so.
@@ -77,8 +84,6 @@ struct Package {
     /// Title, authors, language, publisher, date, identifier.
     rows: Vec<(String, String)>,
     pictures: usize,
-    /// The style sheets of the manifest (read only for the classes set in a monospace font).
-    sheets: Vec<String>,
 }
 
 /// A path in a link with its `%20` and the like decoded.
@@ -270,25 +275,51 @@ fn protected(archive: &Archive<'_>) -> bool {
 }
 
 /// The package of the book: found by `META-INF/container.xml`, read.
-fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
-    let container = part(archive, "META-INF/container.xml")?;
-    let container = crate::xml::parse(&container)?;
-    let opf = descendant(container.root_element(), "rootfile")
+/// The texts of the elements `name` (`title`, `creator`, ...) of the package's metadata, each cut to `MAX_TITLE` characters.
+fn values(metadata: Node<'_, '_>, name: &str) -> Vec<String> {
+    children(metadata, name)
+        .map(plain_text)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(MAX_TITLE).collect())
+        .collect()
+}
+
+/// The path of the package (the OPF) that `container.xml` names.
+fn package_path(container: &str) -> Result<String, DecodeError> {
+    let container = crate::xml::parse(container)?;
+    descendant(container.root_element(), "rootfile")
         .and_then(|r| attr(r, "full-path"))
         .map(|p| resolve("", &unescape(p)))
-        .ok_or_else(|| unreadable("the EPUB names no package"))?;
-    let text = part(archive, &opf)?;
-    let document = crate::xml::parse(&text)?;
-    let root = document.root_element();
-    // the manifest: id -> (path, media type, properties)
-    let mut manifest: HashMap<&str, (String, &str, &str)> = HashMap::new();
+        .ok_or_else(|| unreadable("the EPUB names no package"))
+}
+
+/// The title and the authors of the EPUB at `path` (either may be `None`), from its package alone: `container.xml` and the OPF are
+/// read where they lie in the file (`archive::OnDisk`), not the whole book; `None` when they cannot be read.
+pub fn title_and_author(path: &Path) -> Option<(Option<String>, Option<String>)> {
+    let mut zip = crate::archive::OnDisk::open(path).ok()?;
+    let mut part =
+        |name: &str| -> Option<String> { Some(prepare(&decode_text(&zip.read(name, MAX_PART).ok()?).ok()?)) };
+    let opf = package_path(&part("META-INF/container.xml")?).ok()?;
+    let text = part(&opf)?;
+    let document = crate::xml::parse(&text).ok()?;
+    let metadata = child(document.root_element(), "metadata")?;
+    let title = values(metadata, "title").into_iter().next();
+    let authors = values(metadata, "creator").join(", ");
+    Some((title, Some(authors).filter(|a| !a.is_empty())))
+}
+
+/// The manifest of a package: id -> (path from the root of the archive, media type, properties).
+type Manifest<'d> = HashMap<&'d str, (String, &'d str, &'d str)>;
+
+fn manifest<'d>(opf: &str, root: Node<'d, '_>) -> Manifest<'d> {
+    let mut manifest = HashMap::new();
     if let Some(list) = child(root, "manifest") {
         for item in children(list, "item") {
             if let (Some(id), Some(href)) = (attr(item, "id"), attr(item, "href")) {
                 manifest.insert(
                     id,
                     (
-                        target(&opf, href).0,
+                        target(opf, href).0,
                         attr(item, "media-type").unwrap_or(""),
                         attr(item, "properties").unwrap_or(""),
                     ),
@@ -296,6 +327,83 @@ fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
             }
         }
     }
+    manifest
+}
+
+/// The path of the cover the package names: EPUB 3's property `cover-image`, EPUB 2's `<meta name="cover">`, or an image whose id
+/// says cover.
+fn cover_of(root: Node<'_, '_>, manifest: &Manifest<'_>) -> Option<String> {
+    let metadata = child(root, "metadata");
+    manifest
+        .values()
+        .find(|(_, _, properties)| properties.split_whitespace().any(|p| p == "cover-image"))
+        .or_else(|| {
+            let id = metadata
+                .into_iter()
+                .flat_map(|m| children(m, "meta"))
+                .find(|m| attr(*m, "name") == Some("cover"))
+                .and_then(|m| attr(m, "content"))?;
+            manifest.get(id)
+        })
+        .or_else(|| {
+            manifest
+                .iter()
+                .find(|(id, (_, media, _))| media.starts_with("image/") && id.to_ascii_lowercase().contains("cover"))
+                .map(|(_, item)| item)
+        })
+        .filter(|(_, media, _)| media.starts_with("image/"))
+        .map(|(path, _, _)| path.clone())
+}
+
+/// The cover picture of the EPUB at `path`, reading only the package, perhaps the first part of the order, and the picture where
+/// they lie in the file (`archive::OnDisk`), not the book: the picture the package names (`cover_of`), else the first picture of the
+/// first part (a page that shows the cover). `None` when there is none, or it cannot be read, or the limits of a picture are met.
+pub fn cover(path: &Path) -> Option<RgbaImage> {
+    let mut zip = crate::archive::OnDisk::open(path).ok()?;
+    let container = prepare(&decode_text(&zip.read("META-INF/container.xml", MAX_PART).ok()?).ok()?);
+    let opf = package_path(&container).ok()?;
+    let text = prepare(&decode_text(&zip.read(&opf, MAX_PART).ok()?).ok()?);
+    let document = crate::xml::parse(&text).ok()?;
+    let root = document.root_element();
+    let manifest = manifest(&opf, root);
+    let picture = cover_of(root, &manifest).or_else(|| {
+        let first = child(root, "spine")
+            .into_iter()
+            .flat_map(|s| children(s, "itemref"))
+            .find_map(|r| manifest.get(attr(r, "idref")?))
+            .map(|(path, _, _)| path.clone())?;
+        let page = prepare(&decode_text(&zip.read(&first, MAX_PART).ok()?).ok()?);
+        let page = crate::xml::parse(&page).ok()?;
+        // a page that shows a picture, not a page of text with a picture in it (a title page with the publisher's sign)
+        let words: usize = page
+            .descendants()
+            .filter(|n| n.is_text())
+            .filter_map(|n| n.text())
+            .map(|t| t.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        if words > MAX_COVER_TEXT {
+            return None;
+        }
+        let href = page
+            .descendants()
+            .filter(|n| n.is_element())
+            .find_map(|n| match n.tag_name().name() {
+                "img" => attr(n, "src"),
+                "image" => attr(n, "href"),
+                _ => None,
+            })?;
+        Some(target(&first, href).0)
+    })?;
+    let bytes = zip.read(&picture, MAX_PICTURE).ok()?;
+    book::cover_picture(&bytes)
+}
+
+fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
+    let opf = package_path(&part(archive, "META-INF/container.xml")?)?;
+    let text = part(archive, &opf)?;
+    let document = crate::xml::parse(&text)?;
+    let root = document.root_element();
+    let manifest = manifest(&opf, root);
     let spine_node = child(root, "spine");
     let spine: Vec<String> = spine_node
         .into_iter()
@@ -324,35 +432,10 @@ fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
         })
         .map(|(path, _, _)| path.clone());
     let metadata = child(root, "metadata");
-    // the cover: EPUB 3's property, EPUB 2's meta, or an image named so
-    let cover = manifest
-        .values()
-        .find(|(_, _, properties)| properties.split_whitespace().any(|p| p == "cover-image"))
-        .or_else(|| {
-            let id = metadata
-                .into_iter()
-                .flat_map(|m| children(m, "meta"))
-                .find(|m| attr(*m, "name") == Some("cover"))
-                .and_then(|m| attr(m, "content"))?;
-            manifest.get(id)
-        })
-        .or_else(|| {
-            manifest
-                .iter()
-                .find(|(id, (_, media, _))| media.starts_with("image/") && id.to_ascii_lowercase().contains("cover"))
-                .map(|(_, item)| item)
-        })
-        .filter(|(_, media, _)| media.starts_with("image/"))
-        .map(|(path, _, _)| path.clone());
+    let cover = cover_of(root, &manifest);
     let mut rows: Vec<(String, String)> = Vec::new();
     if let Some(metadata) = metadata {
-        let all = |name: &str| -> Vec<String> {
-            children(metadata, name)
-                .map(plain_text)
-                .filter(|t| !t.is_empty())
-                .map(|t| t.chars().take(MAX_TITLE).collect())
-                .collect()
-        };
+        let all = |name: &str| values(metadata, name);
         let mut push = |label: &str, values: Vec<String>| {
             if !values.is_empty() {
                 rows.push((label.to_string(), values.join(", ")));
@@ -389,13 +472,6 @@ fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
         .values()
         .filter(|(_, media, _)| media.starts_with("image/"))
         .count();
-    let mut sheets: Vec<String> = manifest
-        .values()
-        .filter(|(_, media, _)| *media == "text/css")
-        .map(|(path, _, _)| path.clone())
-        .collect();
-    sheets.sort();
-    sheets.truncate(MAX_SHEETS);
     Ok(Package {
         spine,
         cover,
@@ -403,7 +479,6 @@ fn package(archive: &Archive<'_>) -> Result<Package, DecodeError> {
         ncx,
         rows,
         pictures,
-        sheets,
     })
 }
 
@@ -511,97 +586,79 @@ fn kind(name: &str) -> Kind {
     }
 }
 
-/// The style of a piece of text in an inline element (`mono`: the classes the book's style sheets set in a monospace font).
-fn inline_style(node: Node<'_, '_>, base: &Span, mono: &HashSet<String>) -> Span {
-    let mut span = base.clone();
-    match node.tag_name().name() {
-        "em" | "i" | "cite" | "dfn" | "var" => span.italic = !base.italic,
-        "strong" | "b" => span.bold = true,
-        "code" | "tt" | "kbd" | "samp" => span.mono = true,
-        "sup" | "sub" => span.raised = true,
-        _ => {}
-    }
-    if monospaced(node, mono) {
-        span.mono = true;
-    }
-    if let Some(style) = attr(node, "style") {
-        let style = style.to_ascii_lowercase();
-        if style.contains("italic") {
-            span.italic = true;
-        }
-        if style.contains("bold") {
-            span.bold = true;
-        }
-    }
-    span
-}
-
-/// Whether an element says its lines are centred (by `style` or a class).
-fn centred(node: Node<'_, '_>) -> bool {
-    let style = attr(node, "style").unwrap_or("").to_ascii_lowercase().replace(' ', "");
-    style.contains("text-align:center")
-        || attr(node, "class").is_some_and(|c| c.to_ascii_lowercase().split_whitespace().any(|c| c.contains("center")))
-        || node.tag_name().name() == "center"
-}
-
-/// Whether declarations (`font-family: "PT Mono", monospace; margin: 0`) set a monospace font.
-fn mono_font(declarations: &str) -> bool {
-    declarations.split(';').any(|d| {
-        let Some((name, value)) = d.split_once(':') else {
-            return false;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.to_ascii_lowercase();
-        (name == "font-family" || name == "font")
-            && (value.contains("mono") || value.contains("courier") || value.contains("consolas"))
-    })
-}
-
-/// The classes a style sheet sets in a monospace font: listings that are marked only so (`p.listing-body`, `.code`), and commands in
-/// the text (`span.command`). Only a selector of one element with one class counts (`p.x`, `.x`); one that depends on where the
-/// element is (`pre .x`, `p.x > span`) and the rules of `@font-face` do not. Nothing else of the sheet is read.
-fn mono_classes(css: &str, into: &mut HashSet<String>) {
-    // the comments out
-    let mut text = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(start) = rest.find("/*") {
-        text.push_str(&rest[..start]);
-        rest = rest[start + 2..].split_once("*/").map_or("", |(_, after)| after);
-    }
-    text.push_str(rest);
-    for rule in text.split('}') {
-        // `@media print { p.x { ... ` : the selectors are what stands after the last `{` but one
-        let Some((head, declarations)) = rule.rsplit_once('{') else {
-            continue;
-        };
-        let selectors = head.rsplit('{').next().unwrap_or("").trim();
-        if selectors.starts_with('@') || !mono_font(declarations) {
-            continue;
-        }
-        for selector in selectors.split(',') {
-            let selector = selector.trim();
-            if selector.is_empty() || selector.contains(|c: char| c.is_whitespace() || ">+~:[#*".contains(c)) {
-                continue;
-            }
-            let mut parts = selector.split('.');
-            let element = parts.next().unwrap_or("");
-            let classes: Vec<&str> = parts.collect();
-            if classes.len() == 1 && !classes[0].is_empty() && element.chars().all(|c| c.is_ascii_alphanumeric()) {
-                into.insert(classes[0].to_string());
-            }
-        }
+/// The look of the text of an element as the cascade computes it (`computed`), in a paragraph whose text is `block` points: bold,
+/// italic, the family, small capitals, and its size against the paragraph's (kept within 0.6 and 1.6 of it, so that its line still
+/// holds it).
+fn text_look(computed: &Computed, block: f32) -> Span {
+    let scale = computed.size / block.max(1.0);
+    Span {
+        bold: computed.bold,
+        italic: computed.italic,
+        mono: computed.mono,
+        sans: computed.sans,
+        small_caps: computed.small_caps,
+        scale: ((scale - 1.0).abs() > 0.01).then(|| scale.clamp(0.6, 1.6)),
+        underline: computed.underline,
+        strike: computed.strike,
+        colour: computed.colour,
+        ..Span::default()
     }
 }
 
-/// Whether an element is set in a monospace font by a class of the book's style sheets or by its own `style`.
-fn monospaced(node: Node<'_, '_>, mono: &HashSet<String>) -> bool {
-    attr(node, "class").is_some_and(|c| c.split_whitespace().any(|c| mono.contains(c)))
-        || attr(node, "style").is_some_and(mono_font)
+/// The style of a piece of text in an inline element, `computed` its style from the cascade, in a paragraph whose text is `block`
+/// points: a superscript (`sup`, `vertical-align: super`, a note's number) small and raised, a subscript small and lowered.
+fn inline_style(node: Node<'_, '_>, base: &Span, computed: &Computed, block: f32) -> Span {
+    let name = node.tag_name().name();
+    Span {
+        raised: base.raised || name == "sup" || computed.shift == Shift::Super,
+        lowered: base.lowered || name == "sub" || computed.shift == Shift::Sub,
+        ..text_look(computed, block)
+    }
+}
+
+/// Whether two spans look the same (so that the text of the second can join the first).
+fn same_look(a: &Span, b: &Span) -> bool {
+    a.bold == b.bold
+        && a.italic == b.italic
+        && a.mono == b.mono
+        && a.raised == b.raised
+        && a.lowered == b.lowered
+        && a.sans == b.sans
+        && a.small_caps == b.small_caps
+        && a.scale == b.scale
+        && a.underline == b.underline
+        && a.strike == b.strike
+        && a.colour == b.colour
+}
+
+/// The style of the text of a block element, `computed` its style from the cascade, in the block whose style is `outer`, `base` what
+/// the element is (a paragraph, a heading): the size, the alignment and the indent the cascade gives, the margins and padding at its
+/// sides added to those of the blocks it is in, the background the book gives it or the one it is on. Bold and italic are the spans'
+/// (`text_look`), not the paragraph's.
+fn block_style(outer: &Style, computed: &Computed, base: Style) -> Style {
+    let align = computed.align.unwrap_or(Align::Left);
+    let (indent, indent_by) = match computed.indent {
+        Some(points) if points != 0.0 => (true, Some(points)),
+        _ => (false, None),
+    };
+    Style {
+        scale: computed.size / SIZE,
+        bold: false,
+        italic: false,
+        align,
+        loose: align == Align::Left,
+        indent,
+        indent_by,
+        left: outer.left + computed.margin[3] + computed.padding[3],
+        right: outer.right + computed.margin[1] + computed.padding[1],
+        shade: computed.background.or(outer.shade),
+        ..base
+    }
 }
 
 /// A line of code as it is drawn: its indent kept as figure spaces (which the layout neither stretches nor breaks at); inside the line
 /// a run of spaces is one space a long line may break at, with figure spaces before it for the rest of the run.
-fn code_text(line: &str) -> String {
+pub(crate) fn code_text(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut leading = true;
     let mut spaces = 0;
@@ -635,12 +692,7 @@ fn code_text(line: &str) -> String {
 fn add_text(run: &mut Vec<Span>, text: &str, style: &Span) {
     let text: String = text.chars().filter(|c| !matches!(c, '\u{AD}' | '\u{200B}')).collect();
     match run.last_mut() {
-        Some(last)
-            if last.bold == style.bold
-                && last.italic == style.italic
-                && last.mono == style.mono
-                && last.raised == style.raised =>
-        {
+        Some(last) if same_look(last, style) => {
             last.text.push_str(&text);
         }
         _ => run.push(Span { text, ..style.clone() }),
@@ -705,26 +757,183 @@ pub(crate) struct Reader<'r, 'a> {
     places: HashMap<String, Vec<(usize, String)>>,
     /// A list's mark (`•`, `3.`) for the next paragraph.
     prefix: Option<String>,
-    /// The classes the book's style sheets set in a monospace font (`mono_classes`).
-    mono: HashSet<String>,
+    /// The style sheets read so far, each once a book, by their path (`css::flatten`).
+    sheets: HashMap<String, Rc<css::Flat>>,
+    /// The space the margins of the blocks ended and begun give before the next one (adjoining margins collapsed to the larger, as
+    /// CSS does), put in before the next block that shows something.
+    gap: f32,
+    /// The part being read brings style sheets of its own (our sheet is HTML's look under them, `css::HTML_SHEET`).
+    styled: bool,
     /// An HTML page (`page_blocks`): its headings `h1` to `h3` make the contents (it has none of its own), its `nav` (a site's menu)
     /// is passed over, and a picture that cannot be read leaves no grey box (a web page's icons and pictures on the network).
     page: bool,
 }
 
-/// Where the text is read: the part's path (links in it are from there), the paragraph's style and the text's.
+/// Where the text is read: the part's path (links in it are from there), the paragraph's style and the text's, the computed style of
+/// the block element it is in (its children inherit from it), and the cascade of the part.
 #[derive(Clone)]
 struct Context<'c> {
     path: &'c str,
     style: Style,
     span: Span,
+    computed: Computed,
+    cascade: &'c Cascade<'c>,
 }
 
-impl Reader<'_, '_> {
+/// How deep `@import`s are followed.
+const MAX_IMPORTS: usize = 4;
+
+/// Elements that keep their own way of being read whatever `display` the book gives them (a heading made `inline` stays a heading).
+fn own_way(name: &str) -> bool {
+    matches!(
+        name,
+        "h1" | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "pre"
+            | "table"
+            | "hr"
+            | "li"
+            | "img"
+            | "image"
+            | "svg"
+            | "br"
+    )
+}
+
+impl<'r, 'a> Reader<'r, 'a> {
+    fn new(source: Source<'r, 'a>, page: bool) -> Self {
+        Reader {
+            source,
+            pictures: book::Pictures::default(),
+            blocks: Vec::new(),
+            places: HashMap::new(),
+            prefix: None,
+            sheets: HashMap::new(),
+            gap: 0.0,
+            styled: false,
+            page,
+        }
+    }
+
     fn push(&mut self, block: Block) {
+        match block {
+            Block::Paragraph { .. } | Block::Picture(_) | Block::Table(_) | Block::Cover(_) | Block::Rule { .. }
+                if self.gap > 0.0 =>
+            {
+                let gap = std::mem::take(&mut self.gap);
+                if self.blocks.len() < MAX_BLOCKS {
+                    self.blocks.push(Block::Space(gap));
+                }
+            }
+            Block::NewPage => self.gap = 0.0,
+            _ => {}
+        }
         if self.blocks.len() < MAX_BLOCKS {
             self.blocks.push(block);
         }
+    }
+
+    /// The path of the file `href` names from the file at `from`.
+    fn resolve(&self, from: &str, href: &str) -> String {
+        match self.source {
+            Source::Archive(_) => target(from, href).0,
+            // a page of a folder links from the folder itself; a sheet in a folder of it imports from there
+            Source::Folder(_) if from.contains('/') => target(from, href).0,
+            Source::Folder(_) => relative(href),
+        }
+    }
+
+    /// The sheet at `path` with those it imports before it (at most `MAX_IMPORTS` deep), each read once a book; at most `MAX_SHEETS`
+    /// sheets a book.
+    fn sheet(&mut self, path: &str, depth: usize, out: &mut Vec<Rc<css::Flat>>) {
+        let flat = match self.sheets.get(path) {
+            Some(flat) => flat.clone(),
+            None => {
+                if self.sheets.len() >= MAX_SHEETS {
+                    return;
+                }
+                let flat = Rc::new(
+                    self.source
+                        .read(path, MAX_SHEET)
+                        .map(|bytes| css::flatten(&String::from_utf8_lossy(&bytes)))
+                        .unwrap_or_default(),
+                );
+                self.sheets.insert(path.to_string(), flat.clone());
+                flat
+            }
+        };
+        if depth < MAX_IMPORTS {
+            for import in &flat.imports {
+                let named = self.resolve(path, import);
+                self.sheet(&named, depth + 1, out);
+            }
+        }
+        out.push(flat);
+    }
+
+    /// The style sheets a document at `path` links (`<link rel="stylesheet">`) and holds (`<style>`), in its order, each with what it
+    /// imports before it.
+    fn sheets_of(&mut self, root: Node<'_, '_>, path: &str) -> Vec<Rc<css::Flat>> {
+        let mut out = Vec::new();
+        for node in root.descendants().filter(Node::is_element) {
+            match node.tag_name().name() {
+                "style" => {
+                    let flat = css::flatten(&plain_text_raw(node));
+                    for import in &flat.imports {
+                        let named = self.resolve(path, import);
+                        self.sheet(&named, 1, &mut out);
+                    }
+                    out.push(Rc::new(flat));
+                }
+                "link" if attr(node, "rel").is_some_and(|r| r.to_ascii_lowercase().contains("stylesheet")) => {
+                    if let Some(href) = attr(node, "href").filter(|h| !h.contains("://")) {
+                        let named = self.resolve(path, href);
+                        self.sheet(&named, 0, &mut out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The body of a document at `path` read as the text of a part: its sheets made into a cascade (ours as HTML suggests under the
+    /// book's, or the look of a book with none), its `html` and `body` computed (their margins are the page's, not the book's).
+    fn read_body(&mut self, root: Node<'_, '_>, body: Node<'_, '_>, path: &str) {
+        let flats = self.sheets_of(root, path);
+        self.styled = !flats.iter().all(|f| f.text.trim().is_empty());
+        let ours = if self.styled { css::HTML_SHEET } else { css::PLAIN_SHEET };
+        let mut sources = vec![(Origin::Ours, ours)];
+        sources.extend(flats.iter().map(|f| (Origin::Book, f.text.as_str())));
+        let cascade = Cascade::new(&sources);
+        let html = cascade.compute(root, &Computed::root());
+        let mut computed = if body == root {
+            html
+        } else {
+            cascade.compute(body, &html)
+        };
+        computed.margin = [0.0; 4];
+        computed.padding = [0.0; 4];
+        computed.display = None;
+        // the background, the breaks of `html` and `body` are the page's, not a box's
+        computed.background = None;
+        computed.break_before = false;
+        computed.break_after = false;
+        let style = block_style(&Style::body(), &computed, Style::body());
+        let context = Context {
+            path,
+            style,
+            span: text_look(&computed, computed.size),
+            computed,
+            cascade: &cascade,
+        };
+        self.anchor(body);
+        self.flow(body, &context, 0);
     }
 
     /// The lines of the contents that lead to an element with this id.
@@ -781,7 +990,10 @@ impl Reader<'_, '_> {
     fn code_lines<'l>(&mut self, lines: impl Iterator<Item = &'l str>, context: &Context<'_>) {
         let style = Style {
             align: Align::Left,
+            loose: false,
             indent: false,
+            indent_by: None,
+            code: true,
             ..context.style.clone()
         };
         for line in lines {
@@ -843,10 +1055,19 @@ impl Reader<'_, '_> {
                 },
             );
         }
+        // a paragraph the book sets with no indent and no space above it, just after another such one: nothing on the page shows where
+        // it begins (a book made by Calibre), so the layout may give it the core's indent (`Style::unmarked`); a line after `br` is no
+        // new paragraph
+        let unmarked = indent
+            && context.style.loose
+            && !context.style.indent
+            && self.gap == 0.0
+            && matches!(self.blocks.last(), Some(Block::Paragraph { style, .. }) if style.loose && !style.code);
         self.push(Block::Paragraph {
             spans,
             style: Style {
                 indent: context.style.indent && indent,
+                unmarked,
                 ..context.style.clone()
             },
         });
@@ -856,15 +1077,17 @@ impl Reader<'_, '_> {
     fn flow(&mut self, node: Node<'_, '_>, context: &Context<'_>, level: usize) {
         let mut run: Vec<Span> = Vec::new();
         let mut indent = true;
-        self.inline(node, &context.span, &mut run, &mut indent, context, level);
+        let parent = context.computed.clone();
+        self.inline(node, (&context.span, &parent), &mut run, &mut indent, context, level);
         self.flush(&mut run, context, indent);
     }
 
-    /// The children of `node` in the paragraph being gathered (`run`); a block element ends it.
+    /// The children of `node` in the paragraph being gathered (`run`), in the style of the text `span` and the computed style of
+    /// `node` (`parent`); a block element ends it.
     fn inline(
         &mut self,
         node: Node<'_, '_>,
-        span: &Span,
+        (span, parent): (&Span, &Computed),
         run: &mut Vec<Span>,
         indent: &mut bool,
         context: &Context<'_>,
@@ -873,7 +1096,12 @@ impl Reader<'_, '_> {
         for c in node.children() {
             if c.is_text() {
                 if let Some(text) = c.text() {
-                    add_text(run, text, span);
+                    // `text-transform`: a word starts after white space or at the start of the paragraph
+                    let word_start = run
+                        .last()
+                        .and_then(|s| s.text.chars().last())
+                        .is_none_or(char::is_whitespace);
+                    add_text(run, &parent.transform.apply(text, word_start), span);
                 }
                 continue;
             }
@@ -886,48 +1114,66 @@ impl Reader<'_, '_> {
                 add_text(run, &plain_text(c), span);
                 continue;
             }
-            match (name, kind(name)) {
-                (_, Kind::Skip) => {}
-                ("nav", _) if self.page => {}
-                ("br", _) => {
+            let kind = kind(name);
+            if kind == Kind::Skip {
+                continue;
+            }
+            let computed = context.cascade.compute(c, parent);
+            if computed.display == Some(Display::None) {
+                continue;
+            }
+            // the book may make an inline element a block (`span { display: block }`) and a block inline (`div { display: inline }`)
+            let block = match computed.display {
+                _ if own_way(name) => kind == Kind::Block,
+                Some(Display::Inline) => false,
+                Some(Display::Block | Display::ListItem | Display::Table) => true,
+                _ => kind == Kind::Block,
+            };
+            match name {
+                "nav" if self.page => {}
+                "br" => {
                     self.flush(run, context, *indent);
                     *indent = false;
                 }
-                ("img" | "image" | "svg", _) => {
+                "img" | "image" | "svg" => {
                     self.flush(run, context, *indent);
                     self.picture_of(c, context.path);
                 }
-                (_, Kind::Inline) => {
-                    let style = inline_style(c, span, &self.mono);
-                    self.inline(c, &style, run, indent, context, level + 1);
+                _ if !block => {
+                    let style = inline_style(c, span, &computed, context.computed.size);
+                    self.inline(c, (&style, &computed), run, indent, context, level + 1);
                 }
-                (_, Kind::Block) => {
+                _ => {
                     self.flush(run, context, *indent);
                     *indent = true;
-                    self.element(c, context, level + 1);
+                    self.element(c, computed, context, level + 1);
                 }
             }
         }
     }
 
-    /// A block element.
-    fn element(&mut self, node: Node<'_, '_>, context: &Context<'_>, level: usize) {
+    /// A block element, `computed` its style from the cascade.
+    fn element(&mut self, node: Node<'_, '_>, computed: Computed, context: &Context<'_>, level: usize) {
         let name = node.tag_name().name();
-        let with = |style: Style| Context {
-            style,
+        if computed.break_before {
+            self.page_break();
+        }
+        self.gap = self.gap.max(computed.margin[0]);
+        // padding above and below: space that does not collapse with the margins
+        if computed.padding[0] > 0.0 {
+            let gap = std::mem::take(&mut self.gap);
+            self.push(Block::Space(gap + computed.padding[0]));
+        }
+        let style = block_style(&context.style, &computed, context.style.clone());
+        let after = computed.margin[2];
+        let (padding_after, break_after) = (computed.padding[2], computed.break_after);
+        let inner = Context {
+            style: style.clone(),
+            span: text_look(&computed, computed.size),
+            computed,
             ..context.clone()
         };
-        let centre = |style: Style| {
-            if centred(node) {
-                Style {
-                    align: Align::Center,
-                    indent: false,
-                    ..style
-                }
-            } else {
-                style
-            }
-        };
+        let with = |style: Style| Context { style, ..inner.clone() };
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let depth = match name {
@@ -944,37 +1190,60 @@ impl Reader<'_, '_> {
                         });
                     }
                 }
-                self.flow(node, &with(Style::heading(depth)), level);
-            }
-            "p" if !monospaced(node, &self.mono) => self.flow(node, &with(centre(context.style.clone())), level),
-            "blockquote" => {
-                self.push(Block::Space(SIZE * 0.4));
-                let style = Style {
-                    left: context.style.left + SIZE * 2.0,
-                    right: context.style.right + SIZE * 2.0,
-                    ..context.style.clone()
+                // the heading's size, weight and keeping with the next line are ours; its alignment, indent, margins the cascade's
+                let heading = Style {
+                    before: 0.0,
+                    after: 0.0,
+                    loose: false,
+                    ..block_style(&context.style, &inner.computed, Style::heading(depth))
                 };
-                self.flow(node, &with(style), level);
-                self.push(Block::Space(SIZE * 0.4));
+                self.flow(node, &with(heading), level);
             }
             "ul" | "ol" => {
-                let numbered = name == "ol";
-                let start: usize = attr(node, "start").and_then(|s| s.parse().ok()).unwrap_or(1);
-                let style = Style {
-                    align: Align::Left,
-                    indent: false,
-                    left: context.style.left + SIZE * 1.5,
-                    ..context.style.clone()
-                };
-                for (n, item) in children(node, "li").enumerate() {
+                // the mark of each item: `list-style-type` (our sheets: a disc, a number for `ol`), or an `ol`'s `type`; numbered from
+                // `start`, down when `reversed`, an item's `value` setting its number
+                let count = children(node, "li").count() as i64;
+                let reversed = name == "ol" && node.has_attribute("reversed");
+                let mut number: i64 = attr(node, "start")
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(if reversed { count } else { 1 });
+                let typed = attr(node, "type").and_then(|t| match t.trim() {
+                    "1" => Some(Marker::Decimal),
+                    "a" => Some(Marker::LowerAlpha),
+                    "A" => Some(Marker::UpperAlpha),
+                    "i" => Some(Marker::LowerRoman),
+                    "I" => Some(Marker::UpperRoman),
+                    _ => None,
+                });
+                for item in children(node, "li") {
                     self.anchor(item);
-                    self.prefix = Some(if numbered {
-                        format!("{}. ", start + n)
-                    } else {
-                        "\u{2022} ".to_string()
-                    });
-                    self.flow(item, &with(style.clone()), level);
+                    let own = inner.cascade.compute(item, &inner.computed);
+                    if own.display == Some(Display::None) {
+                        continue;
+                    }
+                    self.gap = self.gap.max(own.margin[0]);
+                    if let Some(value) = attr(item, "value").and_then(|v| v.trim().parse().ok()) {
+                        number = value;
+                    }
+                    let mark = typed.unwrap_or(own.marker).of(number);
+                    self.prefix = (!mark.is_empty()).then_some(mark);
+                    number += if reversed { -1 } else { 1 };
+                    let style = Style {
+                        loose: false,
+                        ..block_style(&style, &own, style.clone())
+                    };
+                    let after = own.margin[2];
+                    self.flow(
+                        item,
+                        &Context {
+                            style,
+                            computed: own,
+                            ..inner.clone()
+                        },
+                        level,
+                    );
                     self.prefix = None;
+                    self.gap = self.gap.max(after);
                 }
             }
             "pre" => {
@@ -983,10 +1252,10 @@ impl Reader<'_, '_> {
                     .filter(|n| n.is_text())
                     .filter_map(|n| n.text())
                     .collect();
-                self.code_lines(text.lines(), context);
+                self.code_lines(text.lines(), &inner);
             }
             // a listing that only the style sheet sets in a monospace font: a paragraph a line, or a block of lines broken by `br`
-            "p" | "div" if monospaced(node, &self.mono) => {
+            "p" | "div" if inner.computed.mono_own => {
                 let mut text = String::new();
                 self.code_text_of(node, &mut text, level);
                 let lines: Vec<String> = text
@@ -1006,36 +1275,81 @@ impl Reader<'_, '_> {
                 // the line breaks put before and after inner blocks leave no empty line at the ends
                 let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
                 let last = lines.iter().rposition(|l| !l.is_empty()).map_or(first, |l| l + 1);
-                self.code_lines(lines[first..last].iter().map(String::as_str), context);
+                self.code_lines(lines[first..last].iter().map(String::as_str), &inner);
             }
+            // a line in a book with style sheets (HTML's look); the space of before in one with none
+            "hr" if self.styled => self.push(Block::Rule {
+                left: style.left,
+                right: style.right,
+            }),
             "hr" => self.push(Block::Space(SIZE)),
             "table" => {
-                for row in node
-                    .descendants()
-                    .filter(|n| n.is_element() && n.tag_name().name() == "tr")
-                {
-                    let cells: Vec<String> = row.children().filter(|c| c.is_element()).map(plain_text).collect();
-                    self.push(Block::Paragraph {
-                        spans: vec![Span {
-                            text: cells.join("  \u{2502}  "),
-                            ..Span::default()
-                        }],
-                        style: Style::verse(context.style.left),
-                    });
+                // its caption above it, then the table as a grid
+                if let Some(caption) = child(node, "caption") {
+                    let own = inner.cascade.compute(caption, &inner.computed);
+                    if own.display != Some(Display::None) {
+                        self.element(caption, own, &inner, level + 1);
+                    }
                 }
+                for c in node.descendants().filter(|n| n.is_element()) {
+                    self.anchor(c);
+                }
+                self.keep_caption();
+                self.push(Block::Table(crate::fb2::table_of(node, style.left)));
             }
             "img" | "image" | "svg" => self.picture_of(node, context.path),
             "figcaption" | "caption" => self.flow(
                 node,
                 &with(Style {
-                    align: Align::Center,
-                    indent: false,
-                    italic: true,
-                    ..context.style.clone()
+                    loose: false,
+                    ..style.clone()
                 }),
                 level,
             ),
-            _ => self.flow(node, &with(centre(context.style.clone())), level),
+            _ => self.flow(node, &inner, level),
+        }
+        if padding_after > 0.0 {
+            let gap = std::mem::take(&mut self.gap);
+            self.push(Block::Space(gap + padding_after));
+        }
+        self.gap = self.gap.max(after);
+        if break_after {
+            self.page_break();
+        }
+    }
+
+    /// A page break the book's style asks for (`page-break-before: always`): a new page, unless nothing has been put on this one yet
+    /// (a part starts on a page of its own already).
+    fn page_break(&mut self) {
+        let shown = self
+            .blocks
+            .iter()
+            .rev()
+            .take_while(|b| !matches!(b, Block::NewPage | Block::Break))
+            .any(|b| {
+                matches!(
+                    b,
+                    Block::Paragraph { .. } | Block::Picture(_) | Block::Table(_) | Block::Cover(_)
+                )
+            });
+        if shown {
+            self.push(Block::Break);
+        }
+    }
+
+    /// A short paragraph just before a table (its caption, which many books set as a paragraph of its own: "Table 14.1. ...") kept on
+    /// a page with the table's start, as a heading is with its next line: it was left alone at the foot of a page once the book's
+    /// margins made room above it.
+    fn keep_caption(&mut self) {
+        let last = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|b| !matches!(b, Block::Space(_) | Block::Mark { .. }));
+        if let Some(Block::Paragraph { spans, style }) = last
+            && spans.iter().map(|s| s.text.chars().count()).sum::<usize>() <= MAX_CAPTION
+        {
+            style.keep = true;
         }
     }
 
@@ -1090,13 +1404,7 @@ impl Reader<'_, '_> {
             }
         }
         self.marks(here.into_iter());
-        let context = Context {
-            path,
-            style: Style::body(),
-            span: Span::default(),
-        };
-        self.anchor(body);
-        self.flow(body, &context, 0);
+        self.read_body(root, body, path);
         // a place that was never met leads to the end of the part
         let left: Vec<(usize, String)> = self.places.drain().flat_map(|(_, lines)| lines).collect();
         self.marks(left.into_iter());
@@ -1140,21 +1448,7 @@ pub fn blocks(path: &Path) -> Result<Vec<Block>, DecodeError> {
         return Err(unreadable("the book has no text in its order"));
     }
     let toc = toc(&archive, &package);
-    let mut mono = HashSet::new();
-    for sheet in &package.sheets {
-        if let Ok(bytes) = archive.read(sheet, MAX_SHEET) {
-            mono_classes(&String::from_utf8_lossy(&bytes), &mut mono);
-        }
-    }
-    let mut reader = Reader {
-        source: Source::Archive(&archive),
-        pictures: book::Pictures::default(),
-        blocks: Vec::new(),
-        places: HashMap::new(),
-        prefix: None,
-        mono,
-        page: false,
-    };
+    let mut reader = Reader::new(Source::Archive(&archive), false);
     if let Some(cover) = &package.cover {
         let archive = &archive;
         if let Some(image) = reader.pictures.get(cover, || archive.read(cover, MAX_PICTURE).ok()) {
@@ -1188,47 +1482,14 @@ pub fn blocks(path: &Path) -> Result<Vec<Block>, DecodeError> {
 }
 
 /// The blocks of a page of HTML made XML (`html`), whose file is `name` in `folder`: its body read as a part of a book is, its headings
-/// the contents, its pictures from the folder (or from the links themselves), the classes set in a monospace font by its `style`
-/// elements and the style sheets it links to in the folder.
+/// the contents, its pictures from the folder (or from the links themselves), its style from its `style` elements and the style
+/// sheets it links to in the folder.
 pub(crate) fn page_blocks(xml: &str, folder: &Path, name: &str) -> Result<Vec<Block>, DecodeError> {
     let document = crate::xml::parse(xml)?;
     let root = document.root_element();
-    let source = Source::Folder(folder);
-    let mut mono = HashSet::new();
-    let mut sheets = 0;
-    for node in root.descendants().filter(|n| n.is_element()) {
-        match node.tag_name().name() {
-            "style" => mono_classes(&plain_text_raw(node), &mut mono),
-            "link"
-                if sheets < MAX_SHEETS
-                    && attr(node, "rel").is_some_and(|r| r.to_ascii_lowercase().contains("stylesheet")) =>
-            {
-                sheets += 1;
-                if let Some(href) = attr(node, "href").filter(|h| !h.contains("://"))
-                    && let Some(bytes) = source.read(&relative(href), MAX_SHEET)
-                {
-                    mono_classes(&String::from_utf8_lossy(&bytes), &mut mono);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut reader = Reader {
-        source,
-        pictures: book::Pictures::default(),
-        blocks: Vec::new(),
-        places: HashMap::new(),
-        prefix: None,
-        mono,
-        page: true,
-    };
+    let mut reader = Reader::new(Source::Folder(folder), true);
     let body = descendant(root, "body").unwrap_or(root);
-    let context = Context {
-        path: name,
-        style: Style::body(),
-        span: Span::default(),
-    };
-    reader.flow(body, &context, 0);
+    reader.read_body(root, body, name);
     if !reader
         .blocks
         .iter()
@@ -1266,6 +1527,16 @@ pub fn render_first_page(path: &Path) -> Result<RgbaImage, DecodeError> {
 /// Page `page` (from 0) and the number of pages.
 pub fn render_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), DecodeError> {
     book::page(&*book::laid(path, blocks)?, page)
+}
+
+/// As [`render_page`], drawn at the size at which it fits the box `max_width` x `max_height` pixels (`book::page_within`).
+pub fn render_page_within(
+    path: &Path,
+    page: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(RgbaImage, usize), DecodeError> {
+    book::page_within(&*book::laid(path, blocks)?, page, max_width, max_height)
 }
 
 /// The text of every page, for a search.
@@ -1348,7 +1619,8 @@ p.serif { font-family: Georgia, serif }"#;
         format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>x</title><style>p {{ color: red }}</style></head>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>x</title><link rel="stylesheet" type="text/css" href="../styles/book.css"/>
+<style>p {{ color: red }}</style></head>
 <body><h2 id="top">{title}</h2>{body}</body></html>"#
         )
     }
@@ -1444,21 +1716,6 @@ p.serif { font-family: Georgia, serif }"#;
     }
 
     #[test]
-    fn the_style_sheets_give_only_the_classes_set_in_a_monospace_font() {
-        let mut mono = HashSet::new();
-        mono_classes(CSS, &mut mono);
-        let mut found: Vec<&str> = mono.iter().map(String::as_str).collect();
-        found.sort_unstable();
-        assert_eq!(found, ["cmd", "code-line", "listing", "title"]);
-        // a sheet cut off or of nonsense makes nothing and does not stop
-        let mut none = HashSet::new();
-        mono_classes("p.x { font-family: monospace /* never closed", &mut none);
-        mono_classes("}}}{{{ .y { font-family: mono } {", &mut none);
-        mono_classes("", &mut none);
-        assert!(none.contains("y"), "{none:?}");
-    }
-
-    #[test]
     fn a_listing_marked_only_by_its_class_is_set_as_code() {
         let dir = folder("listing");
         let path = dir.join("code.epub");
@@ -1485,7 +1742,10 @@ p.serif { font-family: Georgia, serif }"#;
                 "print(f(2))",
             ]
         );
-        assert!(code.iter().all(|(_, s)| s.align == Align::Left && !s.indent));
+        assert!(code.iter().all(|(_, s)| s.align == Align::Left && !s.indent && s.code));
+        // the listing's class sets it in from the left by 2em (Peekel TV, #235, item 8); the `pre` has no margin of its own
+        let lefts: Vec<f32> = code.iter().map(|(_, s)| s.left).collect();
+        assert_eq!(lefts, [0.0, 2.0 * SIZE, 2.0 * SIZE, 2.0 * SIZE]);
         // the line of no-break spaces alone is an empty line of the listing
         let at = blocks
             .iter()
@@ -1496,6 +1756,250 @@ p.serif { font-family: Georgia, serif }"#;
         assert!(blocks.iter().any(|b| matches!(b, Block::Paragraph { spans, .. }
             if spans.iter().any(|s| s.mono && s.text == "ls") && spans.iter().any(|s| !s.mono && s.text.contains("now")))));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A book of one part whose body is `body`, with `css` as a sheet it links (or none when `css` is `None`).
+    fn styled(css: Option<&str>, body: &str) -> Vec<Block> {
+        let link = if css.is_some() {
+            r#"<link rel="stylesheet" type="text/css" href="style.css"/>"#
+        } else {
+            ""
+        };
+        let part = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>x</title>{link}</head>
+<body>{body}</body></html>"#
+        );
+        let opf = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Styled</dc:title></metadata>
+<manifest><item id="p" href="part.xhtml" media-type="application/xhtml+xml"/><item id="s" href="style.css" media-type="text/css"/>
+<item id="o" href="other.css" media-type="text/css"/></manifest><spine><itemref idref="p"/></spine></package>"#;
+        let mut files: Vec<(&str, &[u8], bool)> = vec![
+            ("mimetype", b"application/epub+zip", false),
+            ("META-INF/container.xml", CONTAINER.as_bytes(), true),
+            ("OEBPS/content.opf", opf.as_bytes(), true),
+            ("OEBPS/part.xhtml", part.as_bytes(), true),
+            // a sheet of the manifest that the part does not link applies to nothing
+            ("OEBPS/other.css", b"p { margin-left: 9em }", true),
+        ];
+        if let Some(css) = css {
+            files.push(("OEBPS/style.css", css.as_bytes(), true));
+        }
+        let dir = folder(&format!("styled-{}", body.len()));
+        let path = dir.join("styled.epub");
+        std::fs::write(&path, crate::archive::tests::zip(&files)).expect("written");
+        let blocks = blocks(&path).expect("reads");
+        let _ = std::fs::remove_dir_all(dir);
+        blocks
+    }
+
+    /// The paragraphs of `blocks` by their first word, with their style, and the spaces between them.
+    fn laid(blocks: &[Block]) -> Vec<(String, Option<Style>, f32)> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { spans, style } => Some((
+                    spans[0].text.split_whitespace().next().unwrap_or("").to_string(),
+                    Some(style.clone()),
+                    0.0,
+                )),
+                Block::Space(points) => Some((String::new(), None, *points)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_style_sheets_of_a_part_give_its_margins_indents_alignment_and_what_is_hidden() {
+        let blocks = styled(
+            Some(
+                "p { margin: 0; text-indent: 1.2em } h2 { margin: 2em 0 1em 3em; text-align: left }
+                 .gap { margin-top: 2em } .after { margin-bottom: 3em } .hidden { display: none } .flush { text-indent: 0 }
+                 div.box { margin-left: 2em } .right { text-align: right } span.block { display: block }",
+            ),
+            "<h2>Heading</h2><p class=\"after\">One</p><p class=\"gap\">Two</p><p class=\"hidden\">Hidden</p>\
+             <p hidden=\"hidden\">Hidden too</p><div class=\"box\"><p class=\"flush\">Three</p></div><p class=\"right\">Four</p>\
+             <p>Five <span class=\"hidden\">hidden</span><span class=\"block\">Six</span></p>",
+        );
+        let laid = laid(&blocks);
+        let words: Vec<&str> = laid
+            .iter()
+            .filter(|(w, ..)| !w.is_empty())
+            .map(|(w, ..)| w.as_str())
+            .collect();
+        // what is hidden is not read; a span made a block is a paragraph of its own
+        assert_eq!(words, ["Heading", "One", "Two", "Three", "Four", "Five", "Six"]);
+        let style = |word: &str| -> Style {
+            laid.iter()
+                .find(|(w, ..)| w == word)
+                .and_then(|(_, s, _)| s.clone())
+                .expect("a paragraph")
+        };
+        // the heading keeps its margin at the left (it lost it before), and is set left as the book says
+        let heading = style("Heading");
+        assert_eq!((heading.left, heading.align), (3.0 * SIZE * 1.5, Align::Left));
+        // the book's indent; none where it says 0; the margin of the block it is in; the book's alignment, left loose for the setting
+        let one = style("One");
+        assert_eq!((one.indent, one.indent_by), (true, Some(1.2 * SIZE)));
+        assert!(one.loose && one.align == Align::Left);
+        let three = style("Three");
+        assert_eq!((three.indent, three.left), (false, 2.0 * SIZE));
+        assert!(style("Four").align == Align::Right && !style("Four").loose);
+        // the margins between blocks collapse to the larger: 3em after One, not 3em and 2em (the heading's margin above it, at the
+        // top of the page, is left out by the layout)
+        let spaces: Vec<f32> = laid.iter().filter(|(w, ..)| w.is_empty()).map(|(.., s)| *s).collect();
+        assert_eq!(spaces[..3], [2.0 * SIZE * 1.5, 1.0 * SIZE * 1.5, 3.0 * SIZE]);
+    }
+
+    #[test]
+    fn a_paragraph_with_nothing_to_show_where_it_begins_is_marked_for_the_layout() {
+        // a book made by Calibre: no indent, no space between its paragraphs
+        let blocks = styled(
+            Some(
+                "p { margin: 0; text-indent: 0 } .spaced { margin-top: 1em } .indented { text-indent: 2em } .c { text-align: center }",
+            ),
+            "<h2>Heading</h2><p>First</p><p>Second</p><p>Third<br/>line</p><p class=\"spaced\">Spaced</p>\
+             <p class=\"indented\">Indented</p><p class=\"c\">Centred</p><p>After</p>",
+        );
+        let unmarked: Vec<(String, bool)> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { spans, style } => Some((spans[0].text.trim().to_string(), style.unmarked)),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("Heading", false),
+            // the first after a heading, one with space above, one with its own indent, a centred one, the line after `br`: shown
+            ("First", false),
+            ("Second", true),
+            ("Third", true),
+            ("line", false),
+            ("Spaced", false),
+            ("Indented", false),
+            ("Centred", false),
+            // after a centred one there is nothing to tell it from either, but a centred line is not a paragraph of the text
+            ("After", false),
+        ];
+        let want: Vec<(String, bool)> = want.iter().map(|(t, u)| (t.to_string(), *u)).collect();
+        assert_eq!(unmarked, want);
+    }
+
+    #[test]
+    fn the_fonts_of_a_part_come_from_its_style_sheets() {
+        let blocks = styled(
+            Some(
+                "body { font-size: 1em } h1 { font-size: 1.5em } .caption { font-family: 'PT Sans', sans-serif; font-weight: bold }
+                 .small { font-size: 0.8em } .sc { font-variant: small-caps } .norm { font-weight: normal }",
+            ),
+            "<h1>Title</h1><p class=\"caption\">Caption <span class=\"norm\">light</span></p>\
+             <p>Text <span class=\"small\">small</span> <span class=\"sc\">Caps</span> <em>it</em></p>",
+        );
+        let paragraphs: Vec<(&Vec<Span>, &Style)> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { spans, style } => Some((spans, style)),
+                _ => None,
+            })
+            .collect();
+        // the heading at the size the book gives it, bold by our sheet
+        let (title, heading) = paragraphs[0];
+        assert!(
+            (heading.scale - 1.5).abs() < 0.01 && title[0].bold,
+            "{heading:?} {title:?}"
+        );
+        // a sans caption, bold, a word of it made normal
+        let (caption, _) = paragraphs[1];
+        assert!(caption[0].sans && caption[0].bold);
+        assert!(caption.iter().any(|s| s.text.contains("light") && s.sans && !s.bold));
+        // in the text: a smaller word, small capitals, emphasis
+        let (text, style) = paragraphs[2];
+        assert!((style.scale - 1.0).abs() < 0.01);
+        let span = |word: &str| text.iter().find(|s| s.text.contains(word)).expect("a span");
+        assert_eq!(span("small").scale, Some(0.8));
+        assert!(span("Caps").small_caps && span("it").italic && !span("Text").italic);
+    }
+
+    #[test]
+    fn lists_breaks_rules_padding_and_the_look_of_words_come_from_the_sheets() {
+        let blocks = styled(
+            Some(
+                "p { margin: 0 } h2 { text-transform: uppercase } .box { background: #eeeeee; padding: 1em 0 }
+                 .new { page-break-before: always } .note { color: navy } ol.none { list-style: none }",
+            ),
+            "<h2>Heading</h2><p>H<sub>2</sub>O and x<sup>2</sup>, <u>under</u>, <s>struck</s>, <span class=\"note\">blue</span>.</p>\
+             <ol type=\"a\" start=\"26\"><li>A</li><li>B</li></ol><ol reversed=\"reversed\"><li>C</li><li value=\"9\">D</li></ol>\
+             <ul><li>E<ul><li>F</li></ul></li></ul><ol class=\"none\"><li>G</li></ol><hr/>\
+             <div class=\"box\"><p>Boxed</p></div><p class=\"new\">New page</p>",
+        );
+        let texts: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { spans, .. } => Some(spans.iter().map(|s| s.text.as_str()).collect::<String>()),
+                _ => None,
+            })
+            .collect();
+        // the heading in capitals; the marks: letters from 26, numbers down, a value, a disc and a circle, none
+        assert_eq!(texts[0], "HEADING");
+        for want in ["z. A", "aa. B", "2. C", "9. D", "\u{2022} E", "\u{25E6} F", "G"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+        let spans = match &blocks
+            .iter()
+            .find(|b| matches!(b, Block::Paragraph { spans, .. } if spans[0].text == "H"))
+        {
+            Some(Block::Paragraph { spans, .. }) => spans.clone(),
+            _ => Vec::new(),
+        };
+        let span = |text: &str| spans.iter().find(|s| s.text == text).expect("a span");
+        assert!(span("2").lowered && !span("2").raised);
+        assert!(spans.iter().any(|s| s.text == "2" && s.raised));
+        assert!(span("under").underline && span("struck").strike);
+        assert_eq!(span("blue").colour, Some([0, 0, 128]));
+        // a line for `hr`; the box on its background with its padding above; a new page before the paragraph that asks for one
+        assert!(blocks.iter().any(|b| matches!(b, Block::Rule { .. })));
+        let boxed = blocks
+            .iter()
+            .position(|b| matches!(b, Block::Paragraph { spans, .. } if spans[0].text == "Boxed"))
+            .expect("the box");
+        assert!(matches!(&blocks[boxed], Block::Paragraph { style, .. } if style.shade == Some([238, 238, 238])));
+        assert!(
+            matches!(blocks[boxed - 1], Block::Space(points) if points >= SIZE),
+            "{:?}",
+            blocks[boxed - 1]
+        );
+        assert!(matches!(blocks[boxed + 2], Block::Break), "{:?}", &blocks[boxed..]);
+    }
+
+    #[test]
+    fn a_part_with_no_style_sheet_keeps_the_look_of_the_books_before() {
+        let blocks = styled(
+            None,
+            "<h2>Heading</h2><p>One</p><p>Two</p><ul><li>Item</li></ul><blockquote><p>Quote</p></blockquote>",
+        );
+        let laid = laid(&blocks);
+        let style = |word: &str| -> Style {
+            laid.iter()
+                .find(|(w, ..)| w == word)
+                .and_then(|(_, s, _)| s.clone())
+                .expect("a paragraph")
+        };
+        let heading = style("Heading");
+        assert_eq!((heading.align, heading.indent), (Align::Center, false));
+        // the size of an `h2` as before (`Style::heading`)
+        assert!((heading.scale - 1.18).abs() < 0.01, "{heading:?}");
+        let one = style("One");
+        assert_eq!((one.align, one.indent, one.left), (Align::Justify, true, 0.0));
+        assert!((one.indent_by.unwrap_or(0.0) - 1.6 * SIZE).abs() < 0.01);
+        let item = style("•");
+        assert_eq!((item.align, item.indent, item.left), (Align::Left, false, 1.5 * SIZE));
+        let quote = style("Quote");
+        assert_eq!((quote.left, quote.right), (2.0 * SIZE, 2.0 * SIZE));
+        // no space between paragraphs; the heading's 0.6 of the size after it
+        let between = blocks
+            .iter()
+            .skip_while(|b| !matches!(b, Block::Paragraph { spans, .. } if spans[0].text == "One"))
+            .nth(1);
+        assert!(matches!(between, Some(Block::Paragraph { .. })), "{between:?}");
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub enum DecodeError {
     NoRoom,
     /// More than 100 megapixels.
     TooLarge,
+    /// A file bigger than its kind is read up to (this many bytes): refused before it is read.
+    FileTooLarge(u64),
     /// Not there, not a picture this program reads, or damaged; the text says which.
     Unreadable(String),
     /// A file that is no picture, which a viewer skips (a font, an archive, a program): not an error to report.
@@ -40,6 +42,7 @@ impl fmt::Display for DecodeError {
         match self {
             Self::NoRoom => f.write_str("no room"),
             Self::TooLarge => f.write_str("too large (over 100 megapixels)"),
+            Self::FileTooLarge(limit) => write!(f, "the file is too large (over {} MB)", limit / (1024 * 1024)),
             Self::Unreadable(why) => f.write_str(why),
             Self::NotAPicture => f.write_str("not a picture"),
         }
@@ -222,7 +225,24 @@ pub fn contents(path: &Path) -> Result<Option<Vec<ContentsItem>>, DecodeError> {
     if crate::html::is_html(path) {
         return crate::html::contents(path);
     }
+    if crate::docx::is_docx(path) {
+        return crate::docx::contents(path);
+    }
     Ok(None)
+}
+
+/// The cover picture of an EPUB or FB2 book, taken from the book's own picture without laying the book out (Peekel TV, #235: a
+/// library's covers had waited for each book to be laid out whole, 25 s for a long one on a tablet): `epub::cover`, `fb2::cover`.
+/// The picture as it is, within the pixels of one picture of a book. `None` for a book with no cover picture, one that cannot be read,
+/// and every other kind of file (a PDF or DjVu: its first page is its cover).
+pub fn cover(path: &Path) -> Option<RgbaImage> {
+    if crate::fb2::is_fb2(path) {
+        return crate::fb2::cover(path);
+    }
+    if crate::epub::is_epub(path) {
+        return crate::epub::cover(path);
+    }
+    None
 }
 
 /// The text of each page of a book, for a search: `Some` for a DjVu file that has a text layer, a PDF that has text, or an FB2 or EPUB
@@ -242,6 +262,9 @@ pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     }
     if crate::html::is_html(path) {
         return crate::html::page_texts(path);
+    }
+    if crate::docx::is_docx(path) {
+        return crate::docx::page_texts(path);
     }
     Ok(None)
 }
@@ -264,13 +287,16 @@ pub fn mark_words(path: &Path, page: usize, needle: &str, image: &mut RgbaImage)
     if crate::html::is_html(path) {
         return crate::html::mark_words(path, page, needle, image);
     }
+    if crate::docx::is_docx(path) {
+        return crate::docx::mark_words(path, page, needle, image);
+    }
     Ok(0)
 }
 
-/// Whether the file is a book whose text flows (FB2, EPUB, an HTML page): laid out into pages here, at the size of text the reader chose
-/// (`book::set_text_size`).
+/// Whether the file is a book whose text flows (FB2, EPUB, an HTML page, a Word document read whole): laid out into pages
+/// here, at the size of text the reader chose (`book::set_text_size`).
 pub fn text_flows(path: &Path) -> bool {
-    crate::fb2::is_fb2(path) || crate::epub::is_epub(path) || crate::html::is_html(path)
+    crate::fb2::is_fb2(path) || crate::epub::is_epub(path) || crate::html::is_html(path) || crate::docx::is_docx(path)
 }
 
 /// The place of page `page` in the text of a book whose text flows (how many words come before it), which stays when the size of the
@@ -285,7 +311,65 @@ pub fn place_of(path: &Path, page: usize) -> Result<Option<usize>, DecodeError> 
     if crate::html::is_html(path) {
         return crate::html::place_of(path, page).map(Some);
     }
+    if crate::docx::is_docx(path) {
+        return crate::docx::place_of(path, page).map(Some);
+    }
     Ok(None)
+}
+
+/// The page of a book whose text flows (FB2, EPUB, HTML) that place `place` ([`place_of`], kept by the reader) is on, drawn for the
+/// box `max_width` x `max_height`, as soon as the part of the book it is in is laid out (a chapter: the rest is laid out when it is
+/// turned to, or by any call that needs the whole book, such as [`page_count`] on a thread of the reader's own); with the pages before
+/// and after it ([`turn_to`]) and its number and the number of pages once they are known (Peekel TV, #235). `None` for any other file.
+pub fn open_at(
+    path: &Path,
+    place: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<Option<crate::book::Shown>, DecodeError> {
+    let Some(read) = blocks_of(path) else {
+        return Ok(None);
+    };
+    crate::book::open_at(path, read, place, max_width, max_height).map(Some)
+}
+
+/// The page `spot` names (the `previous` or `next` of a page [`open_at`] or this gave), drawn for the box; `None` for a file whose text
+/// does not flow.
+pub fn turn_to(
+    path: &Path,
+    spot: crate::book::Spot,
+    max_width: usize,
+    max_height: usize,
+) -> Result<Option<crate::book::Shown>, DecodeError> {
+    let Some(read) = blocks_of(path) else {
+        return Ok(None);
+    };
+    crate::book::turn_to(path, read, spot, max_width, max_height).map(Some)
+}
+
+/// The number of pages of a book whose text flows, the whole of it laid out (what [`open_at`] leaves for later); `None` for any other
+/// file.
+pub fn page_count(path: &Path) -> Result<Option<usize>, DecodeError> {
+    let Some(read) = blocks_of(path) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::book::laid(path, read)?.pages.len()))
+}
+
+/// The reader of the blocks of a book whose text flows, by its kind.
+type ReadBlocks = fn(&Path) -> Result<Vec<crate::book::Block>, DecodeError>;
+fn blocks_of(path: &Path) -> Option<ReadBlocks> {
+    if crate::fb2::is_fb2(path) {
+        Some(crate::fb2::blocks)
+    } else if crate::epub::is_epub(path) {
+        Some(crate::epub::blocks)
+    } else if crate::html::is_html(path) {
+        Some(crate::html::blocks)
+    } else if crate::docx::is_docx(path) {
+        Some(crate::docx::blocks)
+    } else {
+        None
+    }
 }
 
 /// The page that place `place` (from [`place_of`]) is on at the size of the text now; `None` for a file whose text does not flow.
@@ -298,6 +382,9 @@ pub fn page_at(path: &Path, place: usize) -> Result<Option<usize>, DecodeError> 
     }
     if crate::html::is_html(path) {
         return crate::html::page_at(path, place).map(Some);
+    }
+    if crate::docx::is_docx(path) {
+        return crate::docx::page_at(path, place).map(Some);
     }
     Ok(None)
 }
@@ -320,13 +407,157 @@ pub fn decode_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
     if crate::html::is_html(path) {
         return crate::html::render_page(path, page);
     }
+    if crate::docx::is_docx(path) {
+        return crate::docx::render_page(path, page);
+    }
     decode_full(path).map(|image| (image, 1))
+}
+
+/// As [`decode_page`], but a page of a DjVu file or a PDF is drawn at about the size at which it fits the box `max_width` x
+/// `max_height`, never smaller ([`render_page_scaled`]): a scan of 10 to 20 million pixels shown on a screen needs a small part of that.
+/// A box as large as the page gives the page as [`decode_page`] does (a DjVu page: a box more than half as large). A page of a book
+/// whose text flows (FB2, EPUB, HTML) is drawn anew at the size at which it fits the box, smaller or larger than [`decode_page`] gives it
+/// (`book::page_within`). Any other file is as [`decode_page`] gives it.
+pub fn decode_page_within(
+    path: &Path,
+    page: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(RgbaImage, usize), DecodeError> {
+    match page_size(path, page) {
+        Some(size) => {
+            let ((w, h), _) = size?;
+            let scale = crate::view::fit_scale((w, h), (max_width, max_height)).min(1.0);
+            render_page_scaled(path, page, scale)
+        }
+        None if crate::fb2::is_fb2(path) => crate::fb2::render_page_within(path, page, max_width, max_height),
+        None if crate::epub::is_epub(path) => crate::epub::render_page_within(path, page, max_width, max_height),
+        None if crate::html::is_html(path) => crate::html::render_page_within(path, page, max_width, max_height),
+        None if crate::docx::is_docx(path) => crate::docx::render_page_within(path, page, max_width, max_height),
+        None => decode_page(path, page),
+    }
+}
+
+/// The size of a page in pixels (width, height) and how many pages the file has.
+pub type PageSize = ((u32, u32), usize);
+
+/// For a file whose pages can be drawn smaller than [`decode_page`] gives them (a DjVu file, a PDF): the size of page `page` as
+/// [`decode_page`] gives it, and how many pages there are; `None` for any other file.
+pub fn page_size(path: &Path, page: usize) -> Option<Result<PageSize, DecodeError>> {
+    if crate::djvu::is_djvu(path) {
+        Some(crate::djvu::page_size(path, page))
+    } else if crate::pdf::is_pdf(path) {
+        Some(crate::pdf::page_size(path, page))
+    } else {
+        None
+    }
+}
+
+/// The part of its size (0 to 1) up to which a page of `path` is made directly smaller by [`render_page_scaled`]; above it the whole
+/// page is made (a DjVu page is put together from layers at most halved; a PDF is drawn at any scale). `None` for a file whose pages
+/// are not drawn smaller.
+pub fn smaller_up_to(path: &Path) -> Option<f64> {
+    if crate::djvu::is_djvu(path) {
+        Some(0.5)
+    } else if crate::pdf::is_pdf(path) {
+        Some(0.999)
+    } else {
+        None
+    }
+}
+
+/// Page `page` of a DjVu file or a PDF drawn at about `scale` (0 to 1) of the size [`decode_page`] gives it, never smaller, and how many
+/// pages there are; any other file as [`decode_page`] gives it.
+pub fn render_page_scaled(path: &Path, page: usize, scale: f64) -> Result<(RgbaImage, usize), DecodeError> {
+    if crate::djvu::is_djvu(path) {
+        return crate::djvu::render_page_scaled(path, page, scale);
+    }
+    if crate::pdf::is_pdf(path) {
+        return crate::pdf::render_page_scaled(path, page, scale);
+    }
+    decode_page(path, page)
+}
+
+/// The part `part` of page `page` (in the pixels of the page as [`decode_page`] gives it, as `content::content_box` finds it) made
+/// exactly `width` x `height` pixels, each side scaled on its own. A DjVu page is made at the size at which the part is that size and
+/// the part is cut out, with no shrinking after (the part may be up to a pixel off where it starts); a part to be made bigger than it
+/// is, and any other file, is cut from the page as [`render_page_scaled`] draws it and resized to the size. With how many pages there
+/// are.
+pub fn render_page_part(
+    path: &Path,
+    page: usize,
+    part: crate::content::PageBox,
+    width: u32,
+    height: u32,
+) -> Result<(RgbaImage, usize), DecodeError> {
+    let (width, height) = (width.max(1), height.max(1));
+    let Some(size) = page_size(path, page) else {
+        let (image, count) = decode_page(path, page)?;
+        return Ok((
+            cut_to(&image, part, (image.width(), image.height()), width, height),
+            count,
+        ));
+    };
+    let ((page_w, page_h), _) = size?;
+    let (part_w, part_h) = (part.width.max(1), part.height.max(1));
+    // the size of the whole page at which the part is `width` x `height`
+    let whole = |page: u32, out: u32, part: u32| (f64::from(page) * f64::from(out) / f64::from(part)).round() as u32;
+    let (out_w, out_h) = (whole(page_w, width, part_w), whole(page_h, height, part_h));
+    if crate::djvu::is_djvu(path) && (width..=page_w).contains(&out_w) && (height..=page_h).contains(&out_h) {
+        let (image, count) = crate::djvu::render_page_exact(path, page, out_w as usize, out_h as usize)?;
+        if image.dimensions() == (out_w, out_h) {
+            let at = |start: u32, out: u32, page: u32, side: u32| {
+                ((f64::from(start) * f64::from(out) / f64::from(page)).round() as u32).min(out.saturating_sub(side))
+            };
+            let (x, y) = (at(part.x, out_w, page_w, width), at(part.y, out_h, page_h, height));
+            return Ok((image::imageops::crop_imm(&image, x, y, width, height).to_image(), count));
+        }
+    }
+    let scale = (f64::from(out_w) / f64::from(page_w)).max(f64::from(out_h) / f64::from(page_h));
+    let (image, count) = render_page_scaled(path, page, scale.min(1.0))?;
+    Ok((cut_to(&image, part, (page_w, page_h), width, height), count))
+}
+
+/// The part `part` (in the pixels of a page of `page` size) of `image` (that page drawn at any size), resized to `width` x `height`.
+fn cut_to(image: &RgbaImage, part: crate::content::PageBox, page: (u32, u32), width: u32, height: u32) -> RgbaImage {
+    let (iw, ih) = image.dimensions();
+    let fx = f64::from(iw) / f64::from(page.0.max(1));
+    let fy = f64::from(ih) / f64::from(page.1.max(1));
+    let x = ((f64::from(part.x) * fx).round() as u32).min(iw.saturating_sub(1));
+    let y = ((f64::from(part.y) * fy).round() as u32).min(ih.saturating_sub(1));
+    let w = ((f64::from(part.width) * fx).round() as u32).clamp(1, iw - x);
+    let h = ((f64::from(part.height) * fy).round() as u32).clamp(1, ih - y);
+    let cut = image::imageops::crop_imm(image, x, y, w, h).to_image();
+    if cut.dimensions() == (width, height) {
+        return cut;
+    }
+    crate::resize::triangle(&cut, width, height)
 }
 
 /// A picture held in memory (one inside a document), turned upright, at its own size.
 /// One that claims more than `max_pixels` is refused before it is decoded.
 pub fn decode_bytes(bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, DecodeError> {
     decode_reader(ImageReader::new(std::io::Cursor::new(bytes)), max_pixels, 1)
+}
+
+/// The size of the picture in `bytes` as `decode_bytes` gives it (turned as its EXIF says), read from its header only; the same error
+/// as `decode_bytes` for one that is not a picture or has more than `max_pixels`.
+pub(crate) fn picture_size(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32), DecodeError> {
+    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(unreadable)?
+        .into_decoder()
+        .map_err(unreadable)?;
+    let (w, h) = decoder.dimensions();
+    if u64::from(w) * u64::from(h) > max_pixels.min(MAX_PIXELS) {
+        return Err(DecodeError::TooLarge);
+    }
+    use image::metadata::Orientation::{Rotate90, Rotate90FlipH, Rotate270, Rotate270FlipH};
+    let turned = matches!(
+        decoder.orientation().map_err(unreadable)?,
+        Rotate90 | Rotate90FlipH | Rotate270 | Rotate270FlipH
+    );
+    Ok(if turned { (h, w) } else { (w, h) })
 }
 
 /// The same for a picture that is a part of another file (the preview of a RAW photograph), which says in its own EXIF

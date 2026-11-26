@@ -61,11 +61,58 @@ fn installed(db: &usvg::fontdb::Database, candidates: &[&str]) -> Option<String>
     })
 }
 
+/// The families that stand for "sans serif", "serif" and "monospace", the first that is installed: Windows', Linux's, then Android's
+/// (its `/system/fonts`, which the reader gives as a folder of fonts: `fontdb` reads no system fonts there, nor the aliases of its
+/// `fonts.xml`, Peekel TV, #235).
+const SANS_SERIF: &[&str] = &[
+    "Arial",
+    "Segoe UI",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Noto Sans",
+    "Helvetica",
+    "Ubuntu",
+    "Roboto",
+    "Droid Sans",
+];
+const SERIF: &[&str] = &[
+    "Times New Roman",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Noto Serif",
+    "Georgia",
+    "Droid Serif",
+];
+const MONOSPACE: &[&str] = &[
+    "Courier New",
+    "Consolas",
+    "Liberation Mono",
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+    "Droid Sans Mono",
+    "Roboto Mono",
+    "Cutive Mono",
+];
+
+/// Sets the families that stand for "sans serif", "serif" and "monospace" to the first of [`SANS_SERIF`], [`SERIF`] and [`MONOSPACE`]
+/// that is in `db`; one with none of its list is left as `fontdb` has it.
+pub(crate) fn set_generic_families(db: &mut usvg::fontdb::Database) {
+    if let Some(family) = installed(db, SANS_SERIF) {
+        db.set_sans_serif_family(family);
+    }
+    if let Some(family) = installed(db, SERIF) {
+        db.set_serif_family(family);
+    }
+    if let Some(family) = installed(db, MONOSPACE) {
+        db.set_monospace_family(family);
+    }
+}
+
 /// The installed fonts, read once: it takes a while and every SVG with text needs them.
 ///
 /// The families that stand for "sans serif", "serif" and "monospace" are Arial, Times New Roman and Courier New until
-/// said otherwise, and a machine without them (a Linux one) would draw no text at all: each is set to the first font of
-/// a list that is installed.
+/// said otherwise, and a machine without them (a Linux one, an Android one) would draw no text in them: each is set to the
+/// first font of a list that is installed (`set_generic_families`).
 pub(crate) fn fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     FONTS
@@ -76,44 +123,7 @@ pub(crate) fn fonts() -> Arc<usvg::fontdb::Database> {
                 db.load_fonts_dir(dir);
             }
             db.load_system_fonts();
-            if let Some(family) = installed(
-                &db,
-                &[
-                    "Arial",
-                    "Segoe UI",
-                    "Liberation Sans",
-                    "DejaVu Sans",
-                    "Noto Sans",
-                    "Helvetica",
-                    "Ubuntu",
-                ],
-            ) {
-                db.set_sans_serif_family(family);
-            }
-            if let Some(family) = installed(
-                &db,
-                &[
-                    "Times New Roman",
-                    "Liberation Serif",
-                    "DejaVu Serif",
-                    "Noto Serif",
-                    "Georgia",
-                ],
-            ) {
-                db.set_serif_family(family);
-            }
-            if let Some(family) = installed(
-                &db,
-                &[
-                    "Courier New",
-                    "Consolas",
-                    "Liberation Mono",
-                    "DejaVu Sans Mono",
-                    "Noto Sans Mono",
-                ],
-            ) {
-                db.set_monospace_family(family);
-            }
+            set_generic_families(&mut db);
             Arc::new(db)
         })
         .clone()

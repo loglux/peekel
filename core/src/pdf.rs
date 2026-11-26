@@ -9,9 +9,9 @@
 //! the page is drawn on a thread with a large stack, a panic of it is an error, and the size of the page, of the file and
 //! of the picture are limited before anything is drawn.
 
-use std::path::Path;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, SystemTime};
 
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
@@ -33,9 +33,9 @@ const MAX_SIDE: f32 = 4096.0;
 /// finish by itself, unseen.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Whether the name says PDF.
+/// Whether the name says PDF, or, for a file with no extension, its first bytes (`sniff`).
 pub fn is_pdf(path: &Path) -> bool {
-    has_extension(path, "pdf")
+    has_extension(path, "pdf") || crate::sniff::sniffed(path) == Some(crate::sniff::Sniffed::Pdf)
 }
 
 /// Draws the first page of the PDF in `path` on white. The drawing runs on a thread of its own with a large stack; a
@@ -56,12 +56,83 @@ pub fn render_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
 
 /// `render_page` with another time to wait.
 pub fn render_page_within(path: &Path, page: usize, timeout: Duration) -> Result<(RgbaImage, usize), DecodeError> {
-    if std::fs::metadata(path).map_err(unreadable)?.len() > MAX_BYTES {
-        return Err(DecodeError::TooLarge);
-    }
-    let data = std::fs::read(path).map_err(unreadable)?;
-    on_thread(timeout, move || draw(data, page))?
+    with_pdf(path, timeout, move |pdf| draw(pdf, page, 1.0))
 }
+
+/// Page `page` (a number past the end is the last) drawn at `scale` (0 to 1) of the size [`render_page`] gives it, and how many pages
+/// the PDF has: a page shown in a small window is drawn small, which is less work than drawing it large and shrinking it.
+pub fn render_page_scaled(path: &Path, page: usize, scale: f64) -> Result<(RgbaImage, usize), DecodeError> {
+    let factor = scale.clamp(1e-3, 1.0) as f32;
+    with_pdf(path, TIMEOUT, move |pdf| draw(pdf, page, factor))
+}
+
+/// The size of page `page` (a number past the end is the last) as [`render_page`] draws it, and how many pages the PDF has; nothing
+/// is drawn.
+pub fn page_size(path: &Path, page: usize) -> Result<((u32, u32), usize), DecodeError> {
+    with_pdf(path, TIMEOUT, move |pdf| {
+        let pages = pdf.pages();
+        let count = pages.len();
+        let page = pages
+            .get(page.min(count.saturating_sub(1)))
+            .ok_or_else(|| unreadable("the PDF has no pages"))?;
+        let (width, height) = page.render_dimensions();
+        let scale = scale_for(width, height).ok_or_else(|| unreadable("the page of the PDF has no usable size"))?;
+        // as `render` makes the picture: each side cut to a whole number
+        Ok((
+            (u32::from((width * scale) as u16), u32::from((height * scale) as u16)),
+            count,
+        ))
+    })
+}
+
+/// Runs `job` on the PDF in `path`, parsed (the one kept when it is that file), on a thread with a large stack that is waited for at
+/// most `timeout`.
+fn with_pdf<T: Send + 'static>(
+    path: &Path,
+    timeout: Duration,
+    job: impl FnOnce(&Pdf) -> Result<T, DecodeError> + Send + 'static,
+) -> Result<T, DecodeError> {
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    if meta.len() > MAX_BYTES {
+        return Err(DecodeError::FileTooLarge(MAX_BYTES));
+    }
+    let key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    // the PDF last opened, already parsed, while the file is the same: turning a page parses the file once, not for every page
+    let kept = KEPT
+        .lock()
+        .ok()
+        .and_then(|kept| kept.as_ref().filter(|k| k.key == key).map(|k| Arc::clone(&k.pdf)));
+    let data = match kept {
+        Some(_) => None,
+        None => Some(std::fs::read(path).map_err(unreadable)?),
+    };
+    on_thread(timeout, move || {
+        let pdf = match (kept, data) {
+            (Some(pdf), _) => pdf,
+            (None, Some(data)) => {
+                let pdf = Arc::new(Pdf::new(data).map_err(|e| unreadable(format!("the PDF cannot be read ({e:?})")))?);
+                if let Ok(mut slot) = KEPT.lock() {
+                    *slot = Some(Kept {
+                        key,
+                        pdf: Arc::clone(&pdf),
+                    });
+                }
+                pdf
+            }
+            (None, None) => return Err(unreadable("the PDF could not be read")),
+        };
+        job(&pdf)
+    })?
+}
+
+/// The PDF last opened for its pages, parsed, and the file it was read from (the path, the length and the time it was changed).
+struct Kept {
+    key: (PathBuf, u64, Option<SystemTime>),
+    pdf: Arc<Pdf>,
+}
+
+/// Only the last PDF is kept (a book being read); another file, or the same one changed, is read and parsed again.
+static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
 
 /// Runs `job` on a thread of its own with a large stack and waits for it at most `timeout`; a panic of the job, and a job
 /// that takes longer, are errors (the thread of a job that is given up is left to end by itself).
@@ -254,8 +325,8 @@ fn scale_for(width: f32, height: f32) -> Option<f32> {
     ((width * scale).min(height * scale) >= 1.0 && (width * scale).max(height * scale) <= MAX_SIDE).then_some(scale)
 }
 
-fn draw(data: Vec<u8>, number: usize) -> Result<(RgbaImage, usize), DecodeError> {
-    let pdf = Pdf::new(data).map_err(|e| unreadable(format!("the PDF cannot be read ({e:?})")))?;
+/// Page `number` at `factor` (0 to 1) of the size `SIDE` gives it, and how many pages there are.
+fn draw(pdf: &Pdf, number: usize, factor: f32) -> Result<(RgbaImage, usize), DecodeError> {
     let pages = pdf.pages();
     let count = pages.len();
     let page = pages
@@ -263,6 +334,8 @@ fn draw(data: Vec<u8>, number: usize) -> Result<(RgbaImage, usize), DecodeError>
         .ok_or_else(|| unreadable("the PDF has no pages"))?;
     let (width, height) = page.render_dimensions();
     let scale = scale_for(width, height).ok_or_else(|| unreadable("the page of the PDF has no usable size"))?;
+    // the short side stays at least a pixel
+    let scale = (scale * factor).max(1.0 / width.min(height));
     let pixmap = render(
         page,
         &RenderCache::new(),

@@ -388,11 +388,24 @@ pub fn list_row_at(shape: ListShape, y: f32) -> Option<usize> {
 }
 
 /// A line of a list: the text, how deep it is (it is moved to the right by that), and what stands at the right edge (a page).
+/// Its `kind` says how it is drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListLine {
     pub depth: usize,
     pub text: String,
     pub right: String,
+    pub kind: LineKind,
+}
+
+/// How a line of a list is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LineKind {
+    /// A line that may be chosen: in the ink.
+    Item,
+    /// The name of a part of the list (the parts of the settings): in bold in the soft colour, never chosen.
+    Heading,
+    /// A word about the list at its end (the keys, where the settings are saved): in the soft colour, never chosen.
+    Note,
 }
 
 /// A list of lines, `width` × `height` pixels, transparent behind the text: a title and a line under it, the `lines` that are on the
@@ -611,7 +624,13 @@ fn draw_list(
             );
         }
         let indent = line.depth.min(6) as f32 * size * 1.5;
-        let (text_colour, page_colour) = if marked_here { (bar_ink, bar_ink) } else { (ink, soft) };
+        let (text_colour, page_colour) = if marked_here {
+            (bar_ink, bar_ink)
+        } else if line.kind != LineKind::Item {
+            (soft, soft)
+        } else {
+            (ink, soft)
+        };
         put(
             &mut body,
             left + indent,
@@ -619,7 +638,7 @@ fn draw_list(
             size,
             text_colour,
             &shorten(&line.text, chars_in(text_room - indent)),
-            marked_here,
+            marked_here || line.kind == LineKind::Heading,
             false,
         );
         put(
@@ -728,6 +747,7 @@ mod tests {
                 depth: usize::from(i == 2),
                 text: (*t).to_string(),
                 right: format!("p.{}", 3 + i),
+                kind: LineKind::Item,
             })
             .collect();
         let image = render_list(
@@ -755,12 +775,49 @@ mod tests {
     }
 
     #[test]
+    fn the_heading_of_a_part_is_drawn_in_the_soft_colour_not_the_ink() {
+        let line = |kind: LineKind| ListLine {
+            depth: 0,
+            text: "Books whose text flows".to_string(),
+            right: String::new(),
+            kind,
+        };
+        let drawn =
+            |kind: LineKind| render_list_row(&line(kind), false, 0, 1000, 580, (10, 20), [0, 0, 0]).expect("a row");
+        // the brightest pixel of the text: the ink is near white on black, the soft colour grey
+        let brightest = |image: &RgbaImage| {
+            image
+                .pixels()
+                .filter(|p| p.0[3] == 255)
+                .map(|p| p.0[0])
+                .max()
+                .unwrap_or(0)
+        };
+        let (plain, heading, note) = (
+            brightest(&drawn(LineKind::Item)),
+            brightest(&drawn(LineKind::Heading)),
+            brightest(&drawn(LineKind::Note)),
+        );
+        assert!(
+            plain > 220 && (120..200).contains(&heading) && (120..200).contains(&note),
+            "{plain} {heading} {note}"
+        );
+        // the heading is bold, the note is not: more of the heading's pixels are lit
+        let lit = |image: &RgbaImage| image.pixels().filter(|p| p.0[3] > 128).count();
+        assert!(
+            lit(&drawn(LineKind::Heading)) > lit(&drawn(LineKind::Note)),
+            "the heading is bold"
+        );
+    }
+
+    #[test]
     fn a_strip_of_the_list_is_the_same_rows_as_in_the_whole_list() {
         let lines: Vec<ListLine> = (0..30)
             .map(|i| ListLine {
                 depth: i % 3,
                 text: format!("Глава {i}. Натуральные числа"),
                 right: format!("p.{i}"),
+                kind: LineKind::Item,
             })
             .collect();
         let (width, height) = (1000, 580);
@@ -815,6 +872,7 @@ mod tests {
                 depth: i % 3,
                 text: format!("Глава {i}. Натуральные числа"),
                 right: format!("p.{i}"),
+                kind: LineKind::Item,
             })
             .collect();
         let (width, height, cell) = (1000, 580, (10, 20));

@@ -19,6 +19,7 @@ pub mod jpeg;
 pub mod mmr;
 pub mod nav;
 pub mod page;
+mod scale;
 pub mod text;
 pub mod zp;
 mod zp_table;

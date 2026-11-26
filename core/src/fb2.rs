@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use base64::Engine;
 use image::RgbaImage;
@@ -19,6 +18,7 @@ use crate::archive::Archive;
 use crate::book::{self, Block, SIZE, Span, Style};
 use crate::decode::{ContentsItem, DecodeError};
 use crate::guard::{read_limited, unreadable};
+use crate::page::Picture;
 use crate::xml::{attr, child, children};
 
 /// A bigger file is refused before it is read.
@@ -32,14 +32,20 @@ const MAX_BLOCKS: usize = 4_000_000;
 /// The longest line of the contents, in characters.
 const MAX_TITLE: usize = 200;
 
-/// Whether the name says FB2: `.fb2`, `.fb2.zip` or `.fbz`.
+/// Whether the name says FB2 (`.fb2`, `.fb2.zip` or `.fbz`), or, for a file with no extension, its first bytes (`sniff`).
 pub fn is_fb2(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    name.ends_with(".fb2") || name.ends_with(".fb2.zip") || name.ends_with(".fbz")
+    name.ends_with(".fb2")
+        || name.ends_with(".fb2.zip")
+        || name.ends_with(".fbz")
+        || matches!(
+            crate::sniff::sniffed(path),
+            Some(crate::sniff::Sniffed::Fb2 | crate::sniff::Sniffed::Fb2Zip)
+        )
 }
 
 /// The XML of the book as text: the file itself, or the first `.fb2` in it when it is a ZIP.
@@ -138,6 +144,97 @@ pub(crate) fn plain_text(node: Node<'_, '_>) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The most rows of a table read, and the most a cell spans; a table of more is cut there.
+const MAX_ROWS: usize = 5000;
+const MAX_SPAN: usize = 1000;
+
+/// A table of an FB2, an EPUB or a page of HTML (`<table>`): its rows in order (those of a table inside a cell are that cell's text),
+/// the cells of each (`td`, `th`) with their text, `colspan` and `rowspan`; a row of `<thead>`, or of header cells only, is a row of
+/// its header. A cell's paragraphs and line breaks (`p`, `div`, `li`, `br`, ...) start new lines of it.
+pub(crate) fn table_of(node: Node<'_, '_>, left: f32) -> book::Table {
+    let own = |n: &Node<'_, '_>| n.ancestors().skip(1).find(|a| a.tag_name().name() == "table") == Some(node);
+    let rows = node
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "tr" && own(n))
+        .take(MAX_ROWS)
+        .map(|row| {
+            let cells: Vec<book::Cell> = row
+                .children()
+                .filter(|c| c.is_element() && matches!(c.tag_name().name(), "td" | "th"))
+                .map(|c| {
+                    let span = |name: &str| {
+                        crate::xml::attr(c, name)
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .map_or(1, |n| n.clamp(1, MAX_SPAN))
+                    };
+                    let head = c.tag_name().name() == "th";
+                    // all its text inside `b` or `strong` (a header the book makes so): bold
+                    let bold = head || {
+                        let mut texts = c
+                            .descendants()
+                            .filter(|n| n.is_text() && !n.text().unwrap_or("").trim().is_empty())
+                            .peekable();
+                        texts.peek().is_some()
+                            && texts.all(|t| {
+                                t.ancestors()
+                                    .take_while(|a| *a != c)
+                                    .any(|a| matches!(a.tag_name().name(), "b" | "strong"))
+                            })
+                    };
+                    book::Cell {
+                        text: cell_text(c),
+                        columns: span("colspan"),
+                        rows: span("rowspan"),
+                        head,
+                        bold,
+                    }
+                })
+                .collect();
+            let in_head = row.ancestors().any(|a| a.tag_name().name() == "thead");
+            book::Row {
+                head: in_head || (!cells.is_empty() && cells.iter().all(|c| c.head)),
+                cells,
+            }
+        })
+        .collect();
+    book::Table { rows, left }
+}
+
+/// The text of a cell, its white space made single spaces, a line of its own for each of its paragraphs and line breaks.
+fn cell_text(node: Node<'_, '_>) -> String {
+    let mut out = String::new();
+    for n in node.descendants().skip(1) {
+        if n.is_text() {
+            // the pieces of a line follow each other as they are (`word<b>s</b>` is one word)
+            out.push_str(n.text().unwrap_or(""));
+        } else if n.is_element()
+            && matches!(
+                n.tag_name().name(),
+                "p" | "div"
+                    | "br"
+                    | "li"
+                    | "tr"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "pre"
+                    | "blockquote"
+                    | "empty-line"
+            )
+        {
+            out.push('\n');
+        }
+    }
+    out.split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What reading a book has made, and the pictures it may still decode.
 struct Reader<'a, 'i> {
     /// The pictures of the book by their id: the node of the `binary`.
@@ -154,7 +251,7 @@ impl<'a, 'i> Reader<'a, 'i> {
     }
 
     /// The picture a link (`#cover.jpg`) leads to, decoded once; `None` when there is none or it cannot be read, or the limits are met.
-    fn picture(&mut self, href: &str) -> Option<Arc<RgbaImage>> {
+    fn picture(&mut self, href: &str) -> Option<Picture> {
         let id = href.trim().trim_start_matches('#');
         let binaries = &self.binaries;
         self.pictures.get(id, || {
@@ -297,18 +394,9 @@ impl<'a, 'i> Reader<'a, 'i> {
         self.push(Block::Space(SIZE * 0.4));
     }
 
-    /// A table, a row a line, its cells parted by a bar: enough to read it, not a drawing of it.
+    /// A table, laid out as a grid (`book::Table`).
     fn table(&mut self, node: Node<'_, '_>) {
-        for row in children(node, "tr") {
-            let cells: Vec<String> = row.children().filter(|c| c.is_element()).map(plain_text).collect();
-            self.push(Block::Paragraph {
-                spans: vec![Span {
-                    text: cells.join("  \u{2502}  "),
-                    ..Span::default()
-                }],
-                style: Style::verse(0.0),
-            });
-        }
+        self.push(Block::Table(table_of(node, 0.0)));
     }
 
     /// A body or a section and what is in it; `depth` 0 for a body. In the notes (`notes`) a section's title is no line of the contents
@@ -461,6 +549,16 @@ pub fn render_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
     book::page(&*book::laid(path, blocks)?, page)
 }
 
+/// As [`render_page`], drawn at the size at which it fits the box `max_width` x `max_height` pixels (`book::page_within`).
+pub fn render_page_within(
+    path: &Path,
+    page: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(RgbaImage, usize), DecodeError> {
+    book::page_within(&*book::laid(path, blocks)?, page, max_width, max_height)
+}
+
 /// The text of every page, for a search.
 pub fn page_texts(path: &Path) -> Result<Option<Vec<String>>, DecodeError> {
     Ok(book::texts(&*book::laid(path, blocks)?))
@@ -489,10 +587,107 @@ pub fn page_at(path: &Path, place: usize) -> Result<usize, DecodeError> {
 /// What the description of the book says, for its card: title, authors, genres, language, date, series, publisher, year, ISBN, and how
 /// many pictures it has.
 pub fn properties(path: &Path) -> Vec<(String, String)> {
-    let Ok(text) = text_of(path) else {
-        return Vec::new();
+    text_of(path).map(|text| rows_of(&text)).unwrap_or_default()
+}
+
+/// How much of the start of a book is read for its description: it comes first, before the text.
+const HEAD: usize = 1024 * 1024;
+
+/// The title and the authors of the book at `path` (either may be `None`), from its description: the start of the file, or of the
+/// `.fb2` in it when it is a ZIP (`archive::OnDisk`, not the whole ZIP); the whole book only when the description is not within the
+/// first megabyte.
+pub fn title_and_author(path: &Path) -> (Option<String>, Option<String>) {
+    let rows = match description(path) {
+        Some(text) => rows_of(&text),
+        None => properties(path),
     };
-    let Ok(document) = crate::xml::parse(&text) else {
+    let value = |labels: &[&str]| {
+        rows.iter()
+            .find(|(label, _)| labels.contains(&label.as_str()))
+            .map(|(_, value)| value.clone())
+    };
+    (value(&["Title"]), value(&["Author", "Authors"]))
+}
+
+/// The cover of the FB2 at `path` (`<coverpage>` of its description), without laying the book out nor parsing it whole: the
+/// description from the start of the file (`description`), then the `binary` it names found in the text by its id. `None` when the
+/// book has no cover, or it cannot be read, or the limits of a picture are met.
+pub fn cover(path: &Path) -> Option<RgbaImage> {
+    let id = |text: &str| -> Option<String> {
+        let document = crate::xml::parse(text).ok()?;
+        let title_info = child(document.root_element(), "description").and_then(|d| child(d, "title-info"))?;
+        let href = child(title_info, "coverpage")
+            .and_then(|c| child(c, "image"))
+            .and_then(|i| attr(i, "href"))?;
+        Some(href.trim().trim_start_matches('#').to_string()).filter(|id| !id.is_empty())
+    };
+    // a book whose description names no cover is not read further
+    let (id, text) = match description(path) {
+        Some(head) => (id(&head)?, text_of(path).ok()?),
+        None => {
+            let text = text_of(path).ok()?;
+            (id(&text)?, text)
+        }
+    };
+    let bytes = binary(&text, &id)?;
+    book::cover_picture(&bytes)
+}
+
+/// The bytes of the `binary` whose id is `id`, found in the text of the book by its tag (`<binary id="cover.jpg" ...>`), not by
+/// parsing it.
+fn binary(text: &str, id: &str) -> Option<Vec<u8>> {
+    let mut rest = text;
+    while let Some(start) = rest.find("<binary") {
+        rest = &rest[start + 7..];
+        let end = rest.find('>')?;
+        let (tag, after) = (&rest[..end], &rest[end + 1..]);
+        // the tag alone, parsed: its attributes as XML has them (quotes, spaces, a prefix)
+        let named = crate::xml::parse(&format!("<binary{}/>", tag.trim_end_matches('/')))
+            .is_ok_and(|t| attr(t.root_element(), "id") == Some(id));
+        if named {
+            let body = &after[..after.find("</binary>")?];
+            let compact: Vec<u8> = body.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+            return base64::engine::general_purpose::STANDARD
+                .decode(&compact)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
+                .ok();
+        }
+    }
+    None
+}
+
+/// The description of the book alone, a document of its own: the start of the file (or of the `.fb2` in a ZIP, `archive::OnDisk`) up
+/// to `</description>`, closed with the root. `None` when the description is not within the first `HEAD` bytes.
+fn description(path: &Path) -> Option<String> {
+    let head = || -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut magic = [0u8; 2];
+        file.read_exact(&mut magic).ok()?;
+        if &magic == b"PK" {
+            let mut zip = crate::archive::OnDisk::open(path).ok()?;
+            let name = zip
+                .names()
+                .find(|n| n.to_ascii_lowercase().ends_with(".fb2"))
+                .map(str::to_string)?;
+            return zip.head(&name, HEAD).ok();
+        }
+        let mut head = magic.to_vec();
+        file.take(HEAD as u64 - 2).read_to_end(&mut head).ok()?;
+        Some(head)
+    };
+    // the description closed, then the root: a whole document of its own (an encoding that is not ASCII-like, UTF-16, is read whole)
+    head().and_then(|head| {
+        let end = head.windows(14).position(|w| w == b"</description>")? + 14;
+        let mut part = head[..end].to_vec();
+        part.extend_from_slice(b"</FictionBook>");
+        decode_text(&part).ok()
+    })
+}
+
+/// The rows of the description of the book whose XML is `text`.
+fn rows_of(text: &str) -> Vec<(String, String)> {
+    let Ok(document) = crate::xml::parse(text) else {
         return Vec::new();
     };
     let root = document.root_element();
@@ -708,5 +903,48 @@ mod tests {
         assert!(is_fb2(Path::new("book.fbz")));
         assert!(!is_fb2(Path::new("book.zip")));
         assert!(!is_fb2(Path::new("book.epub")));
+    }
+
+    #[test]
+    fn a_table_is_read_with_its_header_its_spans_and_its_cells_lines() {
+        let xml = r#"<table><thead><tr><th>Set</th><th colspan="2">Combinations</th></tr></thead>
+<tbody><tr><td rowspan="2"><b>Digits</b></td><td>1 <i>million</i></td><td>100 mil<b>lion</b></td></tr>
+<tr><td><p>Two</p><p>lines</p></td><td>with<br/>a break<table><tr><td>inner</td></tr></table></td></tr>
+<tr><td colspan="999999">wide</td><td rowspan="x">bad span</td></tr></tbody></table>"#;
+        let document = crate::xml::parse(xml).expect("parses");
+        let table = table_of(document.root_element(), 4.0);
+        assert_eq!(table.left, 4.0);
+        type Seen<'t> = (&'t str, usize, usize, bool, bool);
+        let rows: Vec<Vec<Seen<'_>>> = table
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.text.as_str(), c.columns, c.rows, c.head, c.bold))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                vec![("Set", 1, 1, true, true), ("Combinations", 2, 1, true, true)],
+                vec![
+                    ("Digits", 1, 2, false, true),
+                    ("1 million", 1, 1, false, false),
+                    ("100 million", 1, 1, false, false)
+                ],
+                // the inner table's rows are not rows of this one; its text is the cell's
+                vec![
+                    ("Two\nlines", 1, 1, false, false),
+                    ("with\na break\ninner", 1, 1, false, false)
+                ],
+                vec![("wide", MAX_SPAN, 1, false, false), ("bad span", 1, 1, false, false)],
+            ]
+        );
+        assert_eq!(
+            table.rows.iter().map(|r| r.head).collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
     }
 }

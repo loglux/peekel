@@ -236,25 +236,48 @@ impl Plane {
         }
     }
 
-    /// The plane as grey levels with 6 fractional bits, rows from the bottom, `block_cols * 32` wide: the coefficients put in
-    /// place and the inverse wavelet transform done.
-    fn reconstruct(&self, width: usize, height: usize) -> (Vec<i16>, usize) {
-        let stride = self.block_cols * 32;
-        let rows = self.block_rows * 32;
+    /// The plane as grey levels with 6 fractional bits, rows from the bottom, `block_cols * 32 / subsample` wide, for a picture of
+    /// `width` x `height`: the coefficients put in place and the inverse wavelet transform done. With a `subsample` of 2, 4, 8 or 16
+    /// (a power of two, at most 16) the plane is that many times smaller each way: the transform stops at that distance, as
+    /// DjVuLibre's subsampled picture does, so only the samples at the multiples of it are made, and only the coefficients that
+    /// fall on them are put in place (the others belong to the finer distances that are not done). It is the same as the samples at
+    /// those places after the transform at the distances 16 to `subsample` on the whole plane: at each distance the lines have the same
+    /// number of samples, the ends being the same.
+    fn reconstruct(&self, width: usize, height: usize, subsample: usize) -> (Vec<i16>, usize) {
+        let tile = 32 / subsample;
+        let stride = self.block_cols * tile;
+        let rows = self.block_rows * tile;
         let mut plane = vec![0i16; stride * rows];
+        // the coefficients of a block that are kept, and where each goes in its tile
+        let kept: Vec<(usize, usize)> = PLACE
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &place)| {
+                let (row, col) = (usize::from(place >> 5), usize::from(place & 31));
+                (row % subsample == 0 && col % subsample == 0)
+                    .then_some((i, row / subsample * stride + col / subsample))
+            })
+            .collect();
         for block_row in 0..self.block_rows {
             for block_col in 0..self.block_cols {
                 let block = &self.coefs[(block_row * self.block_cols + block_col) * 1024..][..1024];
                 if block.iter().all(|&c| c == 0) {
                     continue;
                 }
-                let origin = block_row * 32 * stride + block_col * 32;
-                for (&c, &place) in block.iter().zip(PLACE.iter()) {
-                    plane[origin + usize::from(place >> 5) * stride + usize::from(place & 31)] = c;
+                let origin = block_row * tile * stride + block_col * tile;
+                for &(i, at) in &kept {
+                    plane[origin + at] = block[i];
                 }
             }
         }
-        inverse_wavelet(&mut plane, stride, width, height);
+        inverse_wavelet(
+            &mut plane,
+            stride,
+            width.div_ceil(subsample),
+            height.div_ceil(subsample),
+            16 / subsample,
+            1,
+        );
         (plane, stride)
     }
 }
@@ -289,6 +312,12 @@ fn filter_halves(even: &mut [i32], odd: &mut [i32], along_rows: bool) {
         return;
     }
     let last = ne + no - 1;
+    // Along the rows DjVuLibre keeps the lifted even samples in whole numbers and predicts the odd ones from those, storing the even
+    // ones in 16 bits only at the end; down the columns it stores them first and predicts from what it stored. The two differ only
+    // when a sample does not fit in 16 bits, which the halftone of a scan at 600 dpi kept as a picture makes happen: at full size
+    // the clamping to 0..255 hid it, at a subsample it did not (ddjvu's pictures of such a page, docs/internal/djvu.md).
+    let raw = along_rows;
+    let wrap = |v: i32| if raw { v } else { wrap(v) };
     let at = |even: &[i32], odd: &[i32], i: usize| if i.is_multiple_of(2) { even[i / 2] } else { odd[i / 2] };
     // the first step: for the sample k = 2j the neighbours are odd[j - 1], odd[j], odd[j - 2] and odd[j + 1]
     let lift_at_end = |even: &mut [i32], odd: &[i32], j: usize| {
@@ -337,9 +366,9 @@ fn filter_halves(even: &mut [i32], odd: &mut [i32], along_rows: bool) {
         let k = 2 * j + 1;
         let before = at(even, odd, k - 1);
         odd[j] = if k < last {
-            wrap(odd[j] + ((before + even[j + 1] + 1) >> 1))
+            self::wrap(odd[j] + ((before + even[j + 1] + 1) >> 1))
         } else {
-            wrap(odd[j] + before)
+            self::wrap(odd[j] + before)
         };
     };
     let (from, to) = if last >= 6 { (1, (last - 4) / 2 + 1) } else { (no, no) };
@@ -355,11 +384,16 @@ fn filter_halves(even: &mut [i32], odd: &mut [i32], along_rows: bool) {
             &even[from + 2..][..n],
         );
         for ((((o, &a), &b), &c), &d) in odd[from..to].iter_mut().zip(b3).zip(b1).zip(f1).zip(f3) {
-            *o = wrap(*o + ((9 * (b + c) - (a + d) + 8) >> 4));
+            *o = self::wrap(*o + ((9 * (b + c) - (a + d) + 8) >> 4));
         }
     }
     for j in to..no {
         predict_at_end(even, odd, j);
+    }
+    if raw {
+        for e in even.iter_mut() {
+            *e = self::wrap(*e);
+        }
     }
 }
 
@@ -452,12 +486,13 @@ fn filter_columns(plane: &mut [i16], stride: usize, width: usize, height: usize,
     }
 }
 
-/// The inverse wavelet transform of a plane `width` x `height`, stored in rows of `stride`: for the distances 16, 8, 4, 2, 1 the
-/// samples that are that far apart, down the columns and then along the rows.
-fn inverse_wavelet(plane: &mut [i16], stride: usize, width: usize, height: usize) {
+/// The inverse wavelet transform of a plane `width` x `height`, stored in rows of `stride`: for the distances `from` (16 for a
+/// whole picture), half of that, down to `to` (1 for the whole transform), the samples that are that far apart, down the columns
+/// and then along the rows.
+fn inverse_wavelet(plane: &mut [i16], stride: usize, width: usize, height: usize, from: usize, to: usize) {
     let (mut even, mut odd) = (Vec::new(), Vec::new());
-    let mut s = 16;
-    while s >= 1 {
+    let mut s = from;
+    while s >= to.max(1) {
         filter_columns(plane, stride, width, height, s);
         for y in (0..height).step_by(s) {
             let row = &mut plane[y * stride..y * stride + width];
@@ -569,7 +604,18 @@ impl Iw44 {
 
     /// The picture as RGB, from what was read so far.
     pub fn pixmap(&self) -> Result<Pixmap, Error> {
-        let (width, height) = self.size().ok_or(Error::BadIw44("no first chunk"))?;
+        self.pixmap_subsampled(1)
+    }
+
+    /// The picture as RGB made `subsample` times smaller each way (1, 2, 4, 8 or 16; another number is taken as the power of two
+    /// below it, and more than 16 as 16): `width.div_ceil(subsample)` x `height.div_ceil(subsample)`, each pixel the sample that the
+    /// inverse transform gives at that place when it stops at that distance, as DjVuLibre makes a subsampled picture. For a picture
+    /// that is shown small this is much less work and memory than the whole one; the decoding of the chunks is the same.
+    pub fn pixmap_subsampled(&self, subsample: usize) -> Result<Pixmap, Error> {
+        let subsample = 1usize << subsample.clamp(1, 16).ilog2();
+        let (full_width, full_height) = self.size().ok_or(Error::BadIw44("no first chunk"))?;
+        let (width, height) = (full_width.div_ceil(subsample), full_height.div_ceil(subsample));
+        let reconstruct = |p: &Plane| p.reconstruct(full_width, full_height, subsample);
         // the three planes of a colour picture do not depend on each other: a thread each, when the picture is big enough to pay for
         // it; a plane whose thread could not be made, or came to grief, is done here
         let planes: Vec<(Vec<i16>, usize)> = if self.planes.len() > 1 && width * height >= 1 << 16 {
@@ -577,19 +623,19 @@ impl Iw44 {
                 let started: Vec<_> = self
                     .planes
                     .iter()
-                    .map(|p| std::thread::Builder::new().spawn_scoped(scope, move || p.reconstruct(width, height)))
+                    .map(|p| std::thread::Builder::new().spawn_scoped(scope, move || reconstruct(p)))
                     .collect();
                 started
                     .into_iter()
                     .zip(&self.planes)
                     .map(|(thread, p)| match thread.map(|t| t.join()) {
                         Ok(Ok(done)) => done,
-                        _ => p.reconstruct(width, height),
+                        _ => reconstruct(p),
                     })
                     .collect()
             })
         } else {
-            self.planes.iter().map(|p| p.reconstruct(width, height)).collect()
+            self.planes.iter().map(reconstruct).collect()
         };
         // a grey level with 6 fractional bits, rounded to a whole one
         let level = |v: i16| ((i32::from(v) + 32) >> 6).clamp(-128, 127);
@@ -786,13 +832,100 @@ mod tests {
         for (w, h) in [(20, 10), (32, 32), (1, 1), (5, 30), (31, 17)] {
             let mut plane = Plane::new(w, h);
             plane.coefs[0] = 64 * 20;
-            let (rebuilt, stride) = plane.reconstruct(w, h);
-            for y in 0..h {
-                for x in 0..w {
-                    assert_eq!(rebuilt[y * stride + x], 64 * 20, "{w} x {h} at {x}, {y}");
+            for subsample in [1, 2, 4, 8, 16] {
+                let (rebuilt, stride) = plane.reconstruct(w, h, subsample);
+                for y in 0..h.div_ceil(subsample) {
+                    for x in 0..w.div_ceil(subsample) {
+                        assert_eq!(rebuilt[y * stride + x], 64 * 20, "{w} x {h} / {subsample} at {x}, {y}");
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_subsampled_plane_is_the_whole_transform_stopped_at_its_distance() {
+        // coefficients of any value in planes of several blocks, of sizes that are and are not multiples of the distances
+        for (w, h, seed) in [(70, 45, 1), (100, 33, 2), (64, 64, 3), (33, 97, 4), (17, 5, 5)] {
+            let mut plane = Plane::new(w, h);
+            for (c, n) in plane
+                .coefs
+                .iter_mut()
+                .zip(noise(w.div_ceil(32) * h.div_ceil(32) * 2048, seed).chunks(2))
+            {
+                *c = i16::from_le_bytes([n[0], n[1]]) >> 4;
+            }
+            // the reference: every coefficient in place on the whole plane, the transform from 16 down to the distance only
+            let stride = plane.block_cols * 32;
+            let mut whole = vec![0i16; stride * plane.block_rows * 32];
+            for block_row in 0..plane.block_rows {
+                for block_col in 0..plane.block_cols {
+                    let block = &plane.coefs[(block_row * plane.block_cols + block_col) * 1024..][..1024];
+                    let origin = block_row * 32 * stride + block_col * 32;
+                    for (&c, &place) in block.iter().zip(PLACE.iter()) {
+                        whole[origin + usize::from(place >> 5) * stride + usize::from(place & 31)] = c;
+                    }
+                }
+            }
+            for subsample in [2, 4, 8, 16] {
+                let mut reference = whole.clone();
+                inverse_wavelet(&mut reference, stride, w, h, 16, subsample);
+                let (small, small_stride) = plane.reconstruct(w, h, subsample);
+                for y in (0..h).step_by(subsample) {
+                    for x in (0..w).step_by(subsample) {
+                        assert_eq!(
+                            small[y / subsample * small_stride + x / subsample],
+                            reference[y * stride + x],
+                            "{w} x {h} / {subsample} at {x}, {y}"
+                        );
+                    }
+                }
+            }
+            // and with no subsampling it is the whole transform
+            let mut reference = whole.clone();
+            inverse_wavelet(&mut reference, stride, w, h, 16, 1);
+            let (full, full_stride) = plane.reconstruct(w, h, 1);
+            assert_eq!(full_stride, stride);
+            for y in 0..h {
+                assert_eq!(full[y * stride..][..w], reference[y * stride..][..w]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_subsampled_picture_has_the_size_asked_and_is_near_the_whole_one_shrunk() {
+        let whole = decode(&gray_stream());
+        let mut image = Iw44::new();
+        for chunk in gray_stream() {
+            image.add_chunk(chunk).unwrap();
+        }
+        assert_eq!(image.pixmap_subsampled(1).unwrap(), whole);
+        // a number that is not a power of two is the one below it, and more than 16 is 16
+        for (asked, taken) in [(2, 2), (3, 2), (4, 4), (7, 4), (16, 16), (40, 16), (0, 1)] {
+            let small = image.pixmap_subsampled(asked).unwrap();
+            assert_eq!(
+                (small.width, small.height),
+                (9usize.div_ceil(taken), 17usize.div_ceil(taken)),
+                "{asked}"
+            );
+        }
+        // at half size each pixel is near the mean of the four it stands for (the picture is smooth)
+        let half = image.pixmap_subsampled(2).unwrap();
+        let mut worst = 0i32;
+        for y in 0..half.height {
+            for x in 0..half.width {
+                let (mut sum, mut count) = (0i32, 0i32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (fx, fy) = (2 * x + dx, 2 * y + dy);
+                    if fx < whole.width && fy < whole.height {
+                        sum += i32::from(whole.rgb[(fy * whole.width + fx) * 3]);
+                        count += 1;
+                    }
+                }
+                worst = worst.max((i32::from(half.rgb[(y * half.width + x) * 3]) - sum / count).abs());
+            }
+        }
+        assert!(worst <= 40, "{worst}");
     }
 
     /// The line filter on one line in order, by the halves.
@@ -812,6 +945,8 @@ mod tests {
             return;
         }
         let last = n - 1;
+        // along the rows the lifted even samples are kept whole until the odd ones are predicted from them
+        let lifted = |v: i32| if along_rows { v } else { wrap(v) };
         // the first step, near the ends of the line (k < 4 or k + 3 > last) and away from them
         let lift_at_end = |line: &mut [i32], k: usize| {
             let p1 = if k >= 1 { line[k - 1] } else { 0 };
@@ -832,7 +967,7 @@ mod tests {
             } else {
                 0
             };
-            line[k] = wrap(line[k] - ((9 * (p1 + n1) - (p3 + n3) + 16) >> 5));
+            line[k] = lifted(line[k] - ((9 * (p1 + n1) - (p3 + n3) + 16) >> 5));
         };
         let (mut k, inner_end) = (0, if last >= 7 { (last - 3) & !1 } else { 0 });
         while k <= last && (inner_end == 0 || k < 4) {
@@ -841,7 +976,7 @@ mod tests {
         }
         if inner_end != 0 {
             for k in (4..=inner_end).step_by(2) {
-                line[k] = wrap(line[k] - ((9 * (line[k - 1] + line[k + 1]) - (line[k - 3] + line[k + 3]) + 16) >> 5));
+                line[k] = lifted(line[k] - ((9 * (line[k - 1] + line[k + 1]) - (line[k - 3] + line[k + 3]) + 16) >> 5));
             }
             for k in (inner_end + 2..=last).step_by(2) {
                 lift_at_end(line, k);
@@ -871,6 +1006,54 @@ mod tests {
                 predict_at_end(line, k);
             }
         }
+        for k in (0..=last).step_by(2) {
+            line[k] = wrap(line[k]);
+        }
+    }
+
+    #[test]
+    fn along_the_rows_the_odd_samples_are_predicted_from_even_ones_that_did_not_fit_in_16_bits() {
+        // a line whose lifted even samples go past 16 bits (the halftone of a scan kept as a picture does that): away from the ends
+        // each sample is the formula in whole numbers, stored in 16 bits at the end, as ddjvu makes it; down the columns the even
+        // samples are stored first, so the odd ones differ
+        let mut seed = 7u64;
+        let line: Vec<i32> = (0..24)
+            .map(|k| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // even samples of any size, odd ones large and negative, so that some lifted even samples go past 16 bits and
+                // some do not
+                let size = (seed >> 33) as i32 % 32000;
+                if k % 2 == 0 { size } else { -20000 - size / 2 }
+            })
+            .collect();
+        let lift = |l: &[i64], k: usize| l[k] - ((9 * (l[k - 1] + l[k + 1]) - (l[k - 3] + l[k + 3]) + 16) >> 5);
+        let mut whole: Vec<i64> = line.iter().map(|&v| i64::from(v)).collect();
+        for k in (4..=18).step_by(2) {
+            whole[k] = lift(&whole, k);
+        }
+        let mut odd_whole = [0i64; 24];
+        for k in (7..=15).step_by(2) {
+            odd_whole[k] = whole[k] + ((9 * (whole[k - 1] + whole[k + 1]) - (whole[k - 3] + whole[k + 3]) + 8) >> 4);
+        }
+        assert!(
+            whole[4..=18]
+                .iter()
+                .any(|&v| v > i64::from(i16::MAX) || v < i64::from(i16::MIN))
+        );
+        let filtered = |along_rows: bool| {
+            let mut even: Vec<i32> = line.iter().step_by(2).copied().collect();
+            let mut odd: Vec<i32> = line.iter().skip(1).step_by(2).copied().collect();
+            filter_halves(&mut even, &mut odd, along_rows);
+            (even, odd)
+        };
+        let (even, odd) = filtered(true);
+        for k in (4..=18).step_by(2) {
+            assert_eq!(even[k / 2], i32::from(whole[k] as i16), "even {k}");
+        }
+        for k in (7..=15).step_by(2) {
+            assert_eq!(odd[k / 2], i32::from(odd_whole[k] as i16), "odd {k}");
+        }
+        assert_ne!(filtered(false).1, odd);
     }
 
     #[test]

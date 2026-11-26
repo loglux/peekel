@@ -1042,6 +1042,7 @@ impl Grid {
                 bold: cell.font.bold,
                 italic: cell.font.italic,
                 underline: cell.font.underline,
+                strike: false,
                 colour: cell.font.colour.unwrap_or([0, 0, 0]),
                 family: cell.font.family.clone(),
             };
