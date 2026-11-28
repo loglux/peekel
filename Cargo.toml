@@ -1,9 +1,11 @@
 [workspace]
 members = ["core", "term", "far", "djvu"]
+# copies of other projects' crates, changed for Peekel (vendor/README.md): not members, so our lints do not judge their code
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 authors = ["Vladislav Sorokin"]
 edition = "2024"
 rust-version = "1.99"
@@ -32,3 +34,9 @@ lto = true
 codegen-units = 1
 # no panic = "abort": a panic must unwind so that the terminal's mode and screen are put back (Drop does it)
 strip = true
+
+# hayro-syntax with the JPEG of a page decoded at a reduced size, over zune-jpeg's unreleased reduced IDCT; hayro with a picture
+# shrunk by an area average of our own on 32-bit ARM (vendor/README.md)
+[patch.crates-io]
+hayro = { path = "vendor/hayro" }
+hayro-syntax = { path = "vendor/hayro-syntax" }

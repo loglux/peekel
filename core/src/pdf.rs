@@ -66,6 +66,13 @@ pub fn render_page_scaled(path: &Path, page: usize, scale: f64) -> Result<(RgbaI
     with_pdf(path, TIMEOUT, move |pdf| draw(pdf, page, factor))
 }
 
+/// How far below the size it is drawn at a page's JPEG may be decoded, in per cent: 0 (the default) never below it; more
+/// is faster and a little softer (a magazine page of 2172 pixels drawn at 1200 is decoded at half with 10). For every PDF
+/// drawn after; hayro-syntax's own setting (vendor/README.md).
+pub fn set_reduced_jpeg_slack(percent: u8) {
+    hayro::hayro_syntax::set_reduced_jpeg_slack(percent);
+}
+
 /// The size of page `page` (a number past the end is the last) as [`render_page`] draws it, and how many pages the PDF has; nothing
 /// is drawn.
 pub fn page_size(path: &Path, page: usize) -> Result<((u32, u32), usize), DecodeError> {

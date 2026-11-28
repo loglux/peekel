@@ -867,9 +867,10 @@ pub fn render_within_by(
 }
 
 /// The page made exactly `out_w` x `out_h` pixels (the page as it is shown, turned as its `INFO` says), each side scaled on its own,
-/// for a caller that cuts a part of it and needs that part at a size to the pixel. At half the page or less along both sides it is made
-/// small directly as [`render_within_by`] makes it, the way `look` says; else (or when the background is too small for that) the whole
-/// page is made and each pixel is the mean of the pixels it covers. A size bigger than the page is the page's size.
+/// for a caller that cuts a part of it and needs that part at a size to the pixel. Smaller than the page, it is made small directly as
+/// [`render_within_by`] makes it, the way `look` says: with our mask (`Shrink::Mean`) at any size, with DjVuLibre's at half the page or
+/// less along both sides; else (or when the background is too small for that) the whole page is made and each pixel is the mean of
+/// the pixels it covers. A size bigger than the page is the page's size.
 ///
 /// # Errors
 /// As [`render`].
@@ -890,8 +891,14 @@ pub fn render_exact(
         Rotation::None | Rotation::Turn180 => (out_w, out_h),
     };
     let (out_w, out_h) = (out_w.clamp(1, width.max(1)), out_h.clamp(1, height.max(1)));
-    if out_w * 2 <= width
-        && out_h * 2 <= height
+    // our mask (each small pixel the mean of the page's pixels it covers) holds at any size below the page's: a part of a page cropped
+    // to its print and drawn at 1/1.7 of it is made small too, not whole and shrunk (6 to 8 times the time on a tablet); DjVuLibre's
+    // way counts the mask at a whole reduction, so it stays at half or less
+    let smaller = match look.mask {
+        Shrink::Mean => (out_w, out_h) != (width, height),
+        Shrink::AsDjvulibre | Shrink::FirstChunk => out_w * 2 <= width && out_h * 2 <= height,
+    };
+    if smaller
         && let Some(small) = reduced(page, dictionary, out_w, out_h, look)?
         && (small.width, small.height) == (out_w, out_h)
     {
@@ -908,6 +915,42 @@ pub fn render_exact(
         height: shown_h,
         rgb: shrunk(&whole, shown_w, shown_h),
     })
+}
+
+/// The page made directly at `out_w` x `out_h` pixels (the page as it is shown; each at most the page's) with our mask
+/// (`Shrink::Mean`), or `None` when it cannot be made so: the background is smaller than that (it is not made big again here), the
+/// mask is a Fax G4 one, or `look` puts the mask on as DjVuLibre does (at a whole reduction only). For a caller that would else make
+/// the whole page and shrink it: on a PC a black and white page at 0.6 to 0.9 of its size took 57 % of that time; a page whose
+/// background is too small is better made whole and shrunk by the caller, whose shrinking is quicker than [`render_exact`]'s
+/// (docs/internal/djvu.md, "Made small directly between a half and the whole").
+///
+/// # Errors
+/// As [`render`].
+pub fn render_smaller(
+    page: &Page<'_, '_>,
+    dictionary: Option<&jb2::Dictionary>,
+    out_w: usize,
+    out_h: usize,
+    look: Small,
+) -> Result<Option<Pixmap>, Error> {
+    let (width, height) = (usize::from(page.info.width), usize::from(page.info.height));
+    if width * height > MAX_PIXELS {
+        return Err(Error::BadPage("the page has more pixels than the limit"));
+    }
+    if look.mask != Shrink::Mean {
+        return Ok(None);
+    }
+    let (out_w, out_h) = match page.info.rotation {
+        Rotation::Ccw90 | Rotation::Cw90 => (out_h, out_w),
+        Rotation::None | Rotation::Turn180 => (out_w, out_h),
+    };
+    let (out_w, out_h) = (out_w.clamp(1, width.max(1)), out_h.clamp(1, height.max(1)));
+    if (out_w, out_h) == (width, height) {
+        return Ok(None);
+    }
+    Ok(reduced(page, dictionary, out_w, out_h, look)?
+        .filter(|small| (small.width, small.height) == (out_w, out_h))
+        .map(|small| turned(corrected(small, page.info.gamma), page.info.rotation)))
 }
 
 /// The size of the picture that the first chunk of the layer `id` gives (the header of the chunk), without decoding the picture.
@@ -1724,6 +1767,62 @@ mod tests {
         let bytes = file(170, 96, &[(b"Sjbz", &jb2::tests::LETTERS[..])]);
         let page = exact(&bytes, 61, 29);
         assert_eq!((page.width, page.height), (61, 29));
+    }
+
+    #[test]
+    fn a_page_of_letters_made_more_than_half_its_size_is_made_small_directly_and_looks_as_the_whole_page_shrunk() {
+        // a page cropped to its print is drawn at 1/1.7 of it on a tablet: made small directly (our mask), not whole and shrunk
+        let bytes = file(170, 96, &[(b"Sjbz", &jb2::tests::LETTERS[..])]);
+        let document = Document::parse(&bytes).unwrap();
+        let page = document.page(0).unwrap();
+        let whole = render_with(&page, None).unwrap();
+        for (w, h) in [(120, 68), (150, 90), (169, 96)] {
+            let made = render_exact(&page, None, w, h, Small::default()).unwrap();
+            assert_eq!(
+                Some(&made),
+                reduced(&page, None, w, h, Small::default()).unwrap().as_ref(),
+                "{w} x {h}"
+            );
+            // each pixel the mean of the pixels it covers, as the whole page shrunk, the pixels given out a little otherwise
+            let mean = shrunk(&whole, w, h);
+            let diff: u64 = made.rgb.iter().zip(&mean).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
+            assert!(
+                diff < 16 * made.rgb.len() as u64,
+                "{w} x {h}: {}",
+                diff / made.rgb.len() as u64
+            );
+        }
+        // DjVuLibre's way counts the mask at a whole reduction: above a half the page is made whole and shrunk, as before
+        let djvulibre = render_exact(&page, None, 120, 68, DJVULIBRE).unwrap();
+        assert_eq!(djvulibre.rgb, shrunk(&whole, 120, 68));
+    }
+
+    #[test]
+    fn a_page_made_smaller_directly_is_made_so_only_when_it_can_be_and_says_none_else() {
+        // a page of letters (no background) above a half: made small directly, as render_exact makes it
+        let bytes = file(170, 96, &[(b"Sjbz", &jb2::tests::LETTERS[..])]);
+        let document = Document::parse(&bytes).unwrap();
+        let page = document.page(0).unwrap();
+        for (w, h) in [(120, 68), (150, 90), (85, 48)] {
+            let made = render_smaller(&page, None, w, h, Small::default()).unwrap();
+            assert_eq!(
+                made,
+                Some(render_exact(&page, None, w, h, Small::default()).unwrap()),
+                "{w} x {h}"
+            );
+        }
+        // the page's own size, and DjVuLibre's mask (a whole reduction only): none, the caller makes the whole page
+        assert_eq!(render_smaller(&page, None, 170, 96, Small::default()).unwrap(), None);
+        assert_eq!(render_smaller(&page, None, 120, 68, DJVULIBRE).unwrap(), None);
+        // a page of 72 x 72 whose background is 24 x 24: at 60 the background is too small, none; at 24 it is made
+        let bytes = ramp_page();
+        let document = Document::parse(&bytes).unwrap();
+        let page = document.page(0).unwrap();
+        assert_eq!(render_smaller(&page, None, 60, 60, Small::default()).unwrap(), None);
+        let at_24 = render_smaller(&page, None, 24, 24, Small::default())
+            .unwrap()
+            .expect("made");
+        assert_eq!((at_24.width, at_24.height), (24, 24));
     }
 
     #[test]

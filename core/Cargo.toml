@@ -19,7 +19,7 @@ jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms"
 flate2 = "1.1"
 peekel-djvu = { path = "../djvu" }
 moxcms = "0.8.1"
-hayro = "0.8.0"
+hayro = "0.9.0"
 # already in the tree (hayro uses it): the names, weight and letters of a font file
 skrifa = "0.46.2"
 roxmltree = "0.21.2"
@@ -29,6 +29,11 @@ simplecss = "0.2.2"
 base64 = "0.23.1"
 resvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 html5ever = "0.40"
+
+[features]
+# NEON by hand on 32-bit ARM in the vendored hayro (vendor/README.md): needs RUSTC_BOOTSTRAP=1 for Rust's unstable NEON intrinsics;
+# off, the same code runs in plain loops, the same bytes a little slower
+nightly-neon = ["hayro/nightly-neon"]
 
 [lints]
 workspace = true

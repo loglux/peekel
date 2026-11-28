@@ -129,18 +129,15 @@ pub fn content_box(path: &Path, page: usize, options: BoxOptions) -> Result<Opti
 
 /// One box for the pages of the same side as page `page` round it (`page` and up to two before and two after it, two apart): the median
 /// of each of their edges, widened to take in all the print of `page` itself; in the pixels of `page` as `decode::decode_page` draws it,
-/// with the room `options` asks for. `None` when `page` has nothing on it, and for any file but a PDF or DjVu file.
+/// with the room `options` asks for. `None` when `page` has nothing on it, and for any file but a PDF or DjVu file. The neighbours are
+/// looked at on threads of their own, side by side with the page (one kept from before is not drawn again).
 pub fn shared_content_box(path: &Path, page: usize, options: BoxOptions) -> Result<Option<PageBox>, DecodeError> {
     let Some(size) = crate::decode::page_size(path, page) else {
         return Ok(None);
     };
     let ((width, height), count) = size?;
     let page = page.min(count.saturating_sub(1));
-    let Some(own) = found(path, page, (width, height))? else {
-        return Ok(None);
-    };
-    let mut all = vec![own.edges(options.heads)];
-    for other in [
+    let neighbours: Vec<usize> = [
         page.checked_sub(4),
         page.checked_sub(2),
         page.checked_add(2),
@@ -149,16 +146,41 @@ pub fn shared_content_box(path: &Path, page: usize, options: BoxOptions) -> Resu
     .into_iter()
     .flatten()
     .filter(|&other| other < count)
-    {
-        let other_size = match crate::decode::page_size(path, other) {
-            Some(Ok((size, _))) => size,
-            // a neighbour that cannot be read is left out: the page's own box still stands
-            _ => continue,
-        };
-        if let Ok(Some(found)) = found(path, other, other_size) {
-            all.push(found.edges(options.heads));
-        }
-    }
+    .collect();
+    // a neighbour that cannot be read is left out: the page's own box still stands
+    let neighbour = |other: usize| match crate::decode::page_size(path, other) {
+        Some(Ok((size, _))) => found(path, other, size).ok().flatten(),
+        _ => None,
+    };
+    // the neighbours are looked at each on a thread of its own while this one looks at the page: the first time (a book just opened)
+    // that is five pages drawn small, 1.7-2.2 s one after another on a 32-bit tablet and 0.7-1 s side by side (docs/internal/formats.md,
+    // "The box of a scanned page's content"); later the neighbours are kept and only one of them is new
+    let (own, theirs) = std::thread::scope(|scope| {
+        let threads: Vec<_> = neighbours
+            .iter()
+            .map(|&other| {
+                std::thread::Builder::new()
+                    .name("content box".to_string())
+                    .spawn_scoped(scope, move || neighbour(other))
+                    .map_err(|_| other)
+            })
+            .collect();
+        let own = found(path, page, (width, height));
+        let theirs: Vec<Option<Found>> = threads
+            .into_iter()
+            .map(|thread| match thread {
+                Ok(thread) => thread.join().ok().flatten(),
+                // no thread to be had: looked at here
+                Err(other) => neighbour(other),
+            })
+            .collect();
+        (own, theirs)
+    });
+    let Some(own) = own? else {
+        return Ok(None);
+    };
+    let mut all = vec![own.edges(options.heads)];
+    all.extend(theirs.iter().flatten().map(|found| found.edges(options.heads)));
     let median = |edge: fn(&Edges) -> f64| {
         let mut values: Vec<f64> = all.iter().map(edge).collect();
         values.sort_by(f64::total_cmp);

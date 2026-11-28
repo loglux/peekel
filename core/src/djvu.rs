@@ -426,9 +426,10 @@ pub fn render_page(path: &Path, page: usize) -> Result<(RgbaImage, usize), Decod
 }
 
 /// Page `page` of the file (a number past the end is the last) drawn at about `scale` of its own size (0 to 1; the page as it is
-/// shown, turned as its `INFO` says), never smaller than that, and how many pages the file has. Below a half the page is made directly
-/// at the smaller size, which is far less work and memory than the whole page; at a half or more it is the whole page, as
-/// [`render_page`] gives it, and the caller shrinks it.
+/// shown, turned as its `INFO` says), and how many pages the file has. At a half or less the page is made directly at the smaller
+/// size (never smaller than that), which is far less work and memory than the whole page. Above a half it is made directly at the
+/// size (each side rounded) when it can be (our mask, and a background not smaller than that: most books of black and white scans),
+/// else it is the whole page, as [`render_page`] gives it, and the caller shrinks it.
 pub fn render_page_scaled(path: &Path, page: usize, scale: f64) -> Result<(RgbaImage, usize), DecodeError> {
     render_page_within(path, page, Room::Scale(scale))
 }
@@ -487,7 +488,7 @@ enum Room {
     Whole,
     /// Not smaller than a box of this many pixels (the page as shown) when the box is at most half the page.
     Box(usize, usize),
-    /// Not smaller than this part of its own size, when that is at most a half.
+    /// Not smaller than this part of its own size, when that is at most a half; above it, at that part when it can be made so.
     Scale(f64),
     /// As `Scale`, rougher and faster: the background from its first chunk only (`page::Shrink::FirstChunk`), for finding the print.
     Glance(f64),
@@ -558,6 +559,20 @@ fn draw(data: &Arc<Vec<u8>>, index: usize, room: Room) -> Result<(RgbaImage, usi
                 _ => small(),
             };
             page::render_within_by(&page, dictionary.as_deref(), side(w), side(h), look)
+        }
+        Room::Scale(scale) if scale > 0.5 && scale < 1.0 => {
+            // between a half and the whole: made small directly when it can be (a black and white page: 57 % of the time of the whole
+            // page shrunk, on a PC), else the whole page, which the caller shrinks; each side rounded, as the viewer sizes the page
+            let (w, h) = (f64::from(page.info.width), f64::from(page.info.height));
+            let (w, h) = match page.info.rotation {
+                Rotation::Ccw90 | Rotation::Cw90 => (h, w),
+                Rotation::None | Rotation::Turn180 => (w, h),
+            };
+            let side = |n: f64| ((n * scale).round() as usize).max(1);
+            page::render_smaller(&page, dictionary.as_deref(), side(w), side(h), small()).and_then(|made| match made {
+                Some(small) => Ok(small),
+                None => page::render_with(&page, dictionary.as_deref()),
+            })
         }
         Room::Whole | Room::Scale(_) | Room::Glance(_) => page::render_with(&page, dictionary.as_deref()),
     }
